@@ -1,61 +1,182 @@
-<#
-.SYNOPSIS
-Restore the nuget package to the specified folder.
+. $PSScriptRoot\TableOperations.ps1
+. $PSScriptRoot\FileOperations.ps1
 
-.PARAMETER PackageName
-The name of package do download.
+function New-CsuExtensionPackage {
+    param (
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $PackageName,
 
-.PARAMETER PackageRootFolder
-The download root folder.
-#>
-[CmdletBinding()]
-param(
-    [string]
-    $PackageName,
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $PackagePublisher,
 
-    [string]
-    $PackageRootFolder
-)
-Import-Module (Join-Path $PSScriptRoot "ErrorDecorator.psm1")
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $PackageVersion,
 
-$tempProjectFileName = Join-Path $PackageRootFolder "Temporary.csproj"
-if (Test-Path $tempProjectFileName -ErrorAction SilentlyContinue)
-{
-    Remove-Item -Force $tempProjectFileName
+        [Parameter()]
+        [String]
+        $SdkVersion,
+
+        [Parameter()]
+        [ValidateSet('Valid', 'Invalid')]
+        [String]
+        $ValidationStatus,
+
+        [Parameter()]
+        [String]
+        $PackageDescription
+    )
+
+    try {
+        $body = @{
+            msprov_name       = $PackageName
+            msprov_publisher  = $PackagePublisher
+            msprov_version    = $PackageVersion
+            msprov_sdkversion = $SdkVersion
+            msprov_assettype  = 0 # CSU Extension Package
+        }
+
+        # Add optional fields if provided
+        if ($ValidationStatus) {
+            $statusValue = switch ($ValidationStatus) {
+                'Valid'   { 202570000 }
+                'Invalid' { 202570001 }
+            }
+            $body['msprov_commerceextensionasset_validationstatus'] = $statusValue
+        }
+
+        if ($PackageDescription) {
+            $body['msprov_description'] = $PackageDescription
+        }
+
+        Write-Host "Creating CSU extension package record: $PackageName ($PackageVersion)"
+
+        $recordId = New-Record -setName 'msprov_commerceextensionassets' -body $body
+
+        Write-Host "Successfully created CSU extension package record with ID: $recordId`n" -ForegroundColor Green
+        return $recordId
+    }
+    catch {
+        Write-Error "Failed to create CSU extension package record $PackageName ($PackageVersion): $($_.Exception.Message)`n"
+        throw
+    }
 }
 
-# Since the "dotnet add package" command does not operate on the package level (only at project or solution level),
-# create a temporary project and add a package to it specifying the $PackageRootFolder folder to store the package.
-$tempProjectContent = "<Project Sdk='Microsoft.NET.Sdk'><PropertyGroup><TargetFramework>netstandard2.0</TargetFramework></PropertyGroup></Project>"
-$tempProjectContent | Out-File $tempProjectFileName
+function Set-CsuExtensionPackageFile {
+    param (
+        [Parameter(Mandatory)]
+        [System.Guid]
+        $PackageId,
 
-& dotnet add $tempProjectFileName package $PackageName --package-directory $PackageRootFolder --prerelease --interactive
+        [Parameter(Mandatory)]
+        [ValidateScript({ Test-Path $_ -PathType Leaf })]
+        [String]
+        $FilePath,
 
-if ($LastExitCode -ne 0) {
-    Write-Host
-    Write-Warning "The package '$PackageName' was not retrieved. Please examine the above logs to fix a problem to get the latest package version."
-    Write-Host
+        [Parameter()]
+        [String]
+        $ColumnName = 'msprov_payload'
+    )
+
+    try {
+        $fileInfo = Get-Item -Path $FilePath
+        $fileSizeMB = [Math]::Round($fileInfo.Length / 1MB, 2)
+
+        Write-Host "Uploading CSU extension package file: $($fileInfo.Name) ($fileSizeMB MB)"
+
+        Set-FileColumnInChunks -setName 'msprov_commerceextensionassets' `
+            -id $PackageId `
+            -columnName $ColumnName `
+            -file $fileInfo
+
+        Write-Host "Successfully uploaded CSU extension package file to record: $PackageId`n" -ForegroundColor Green
+    }
+    catch {
+        Write-Error "Failed to upload CSU extension package file: $($_.Exception.Message)`n"
+        throw
+    }
 }
 
-# Delete the temporary project
-if (Test-Path $tempProjectFileName -ErrorAction SilentlyContinue)
-{
-    Remove-Item -Force $tempProjectFileName
+function Get-CsuExtensionPackage {
+    param (
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $PackageName,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $PackageVersion
+    )
+
+    try {
+        Write-Host "Querying CSU extension package: $PackageName ($PackageVersion)"
+
+        $escapedPackageName = $PackageName.Replace("'", "''")
+        $escapedPackageVersion = $PackageVersion.Replace("'", "''")
+        $filter = "?`$filter=msprov_name eq '$escapedPackageName' and msprov_version eq '$escapedPackageVersion' and msprov_assettype eq 0"
+        $response = Get-Records -setName 'msprov_commerceextensionassets' -query $filter
+
+        $records = $response.value
+
+        if (-not $records -or $records.Count -eq 0) {
+            Write-Host "No CSU extension package found: $PackageName ($PackageVersion)" -ForegroundColor Yellow
+            return $null
+        }
+
+        Write-Host "Found $($records.Count) CSU extension package record(s): $PackageName ($PackageVersion)`n" -ForegroundColor Green
+        return $records
+    }
+    catch {
+        Write-Error "Failed to query CSU extension package $PackageName ($PackageVersion): $($_.Exception.Message)`n"
+        throw
+    }
 }
 
-# Delete the temporary project's intermediate output folder (it is created during the package restore).
-$tempProjectObjDirName = Join-Path (Join-Path "Download" "ChannelData") "obj"
-if (Test-Path $tempProjectObjDirName -ErrorAction SilentlyContinue)
-{
-    Get-ChildItem $tempProjectObjDirName -Recurse | Remove-Item
-    Remove-Item -Force $tempProjectObjDirName
+function Get-CsuExtensionPackageFile {
+    param (
+        [Parameter(Mandatory)]
+        [System.Guid]
+        $PackageId,
+
+        [Parameter(Mandatory)]
+        [ValidateScript({ Test-Path $_ -PathType Container })]
+        [String]
+        $OutputDirectory,
+
+        [Parameter()]
+        [String]
+        $ColumnName = 'msprov_payload'
+    )
+
+    try {
+        Write-Host "Downloading CSU extension package file from record: $PackageId"
+
+        $file = Get-FileColumnInChunks -setName 'msprov_commerceextensionassets' `
+            -id $PackageId `
+            -columnName $ColumnName `
+            -outputDirectory $OutputDirectory
+
+        Write-Host "Successfully downloaded CSU extension package file: $($file.Name)`n" -ForegroundColor Green
+        return $file
+    }
+    catch {
+        Write-Error "Failed to download CSU extension package file: $($_.Exception.Message)`n"
+        throw
+    }
 }
 
 # SIG # Begin signature block
 # MIIoUgYJKoZIhvcNAQcCoIIoQzCCKD8CAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCC0XbcG1ejNKp/5
-# dNWeR0Yvf2lcQgtrjww6ku10jqjvh6CCDYUwggYDMIID66ADAgECAhMzAAAEhJji
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCkH0lDp4vhyVxg
+# HqQpKbs8RRWIikHX+xG/HV6lxe2g+KCCDYUwggYDMIID66ADAgECAhMzAAAEhJji
 # EuB4ozFdAAAAAASEMA0GCSqGSIb3DQEBCwUAMH4xCzAJBgNVBAYTAlVTMRMwEQYD
 # VQQIEwpXYXNoaW5ndG9uMRAwDgYDVQQHEwdSZWRtb25kMR4wHAYDVQQKExVNaWNy
 # b3NvZnQgQ29ycG9yYXRpb24xKDAmBgNVBAMTH01pY3Jvc29mdCBDb2RlIFNpZ25p
@@ -132,62 +253,62 @@ if (Test-Path $tempProjectObjDirName -ErrorAction SilentlyContinue)
 # b25kMR4wHAYDVQQKExVNaWNyb3NvZnQgQ29ycG9yYXRpb24xKDAmBgNVBAMTH01p
 # Y3Jvc29mdCBDb2RlIFNpZ25pbmcgUENBIDIwMTECEzMAAASEmOIS4HijMV0AAAAA
 # BIQwDQYJYIZIAWUDBAIBBQCgga4wGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcCAQQw
-# HAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIPjg
-# iQ5wlaaFlBLUJeqx3zs0Cb2EEsRN+q5zEj5DlIAZMEIGCisGAQQBgjcCAQwxNDAy
+# HAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIEmT
+# HlnvA3iWfg047E+x1uVZorkKLLnmEix29tMQH/fnMEIGCisGAQQBgjcCAQwxNDAy
 # oBSAEgBNAGkAYwByAG8AcwBvAGYAdKEagBhodHRwOi8vd3d3Lm1pY3Jvc29mdC5j
-# b20wDQYJKoZIhvcNAQEBBQAEggEARxKore1ZdOFzPHpm2RvjaOURIuHBUzu+l8LJ
-# MRkbwrLJqBTMM9qd7yqF34nXmd/+974gSTZGs2e6FXuMZby5fjbJsqixlZO1m8dT
-# 75OYq6dltceQMQw6HH/qtjQr8DOYlwugQF49/fxYvYdg72mFrMz3rcds/XGEmJIP
-# aI80Peoc8JvUG/d+kllHvxZHZG0iyS9e1SnRqggp5SjgjXpBv8HI1YapeeDvh7tK
-# olxDToAv0f3xbtuxuXsSnWeSSRRrgT7TZDrDAt88U4fx83ish7Bo8+g2FMhurKPu
-# jSvGB/H/cnbqwcVmKJqRtDH4ZPAiGUngmWsgvzJrWdhYB3UhWqGCF60wghepBgor
+# b20wDQYJKoZIhvcNAQEBBQAEggEANn3LNUWuA5QPJweRpB+Hxg6hONuASmUjdIzP
+# 46RKh7v5X2Sb1I4Uos3iHxW/R17jbJVt1lYNPRdXZPIVMtvAztUqPpdyIdFo9E/d
+# fdPMPcg+Em9DFMkuDTDY/W1gpSAxs+VaDRlp/sQ2QORnng7azKBpAH3UXZ1c+F5n
+# nQA+O3hnmzE9mWZyxCkHRpA7jJBOu8q5kV4dkZBcQ/buaOQ6gc+BU4d9vBj1wfzk
+# bNC4pLtuMJVQZYyVg96G8OKwc84bNgEUF502t+xZ53MsRGotXJEuROGGrJ4hByLw
+# bxG2aLWnUDd12bTNKym2HCIqXdchDDxG/O23JUwRPTPd2Z7h/6GCF60wghepBgor
 # BgEEAYI3AwMBMYIXmTCCF5UGCSqGSIb3DQEHAqCCF4YwgheCAgEDMQ8wDQYJYIZI
 # AWUDBAIBBQAwggFaBgsqhkiG9w0BCRABBKCCAUkEggFFMIIBQQIBAQYKKwYBBAGE
-# WQoDATAxMA0GCWCGSAFlAwQCAQUABCDOb8UOljvlaUdMNi4Jo16jkOfqmS+e0NzA
-# lrzC/o2wTwIGabh7rx74GBMyMDI2MDQxMDEwMTIxNC4xNDFaMASAAgH0oIHZpIHW
+# WQoDATAxMA0GCWCGSAFlAwQCAQUABCAWCyRo5TriQcP6DFQUJnbp0UR0pQ5plQIu
+# SnNnsy4OCwIGabzxyuB9GBMyMDI2MDQxMDEwMTIxNC41OTNaMASAAgH0oIHZpIHW
 # MIHTMQswCQYDVQQGEwJVUzETMBEGA1UECBMKV2FzaGluZ3RvbjEQMA4GA1UEBxMH
 # UmVkbW9uZDEeMBwGA1UEChMVTWljcm9zb2Z0IENvcnBvcmF0aW9uMS0wKwYDVQQL
 # EyRNaWNyb3NvZnQgSXJlbGFuZCBPcGVyYXRpb25zIExpbWl0ZWQxJzAlBgNVBAsT
-# Hm5TaGllbGQgVFNTIEVTTjo2QjA1LTA1RTAtRDk0NzElMCMGA1UEAxMcTWljcm9z
-# b2Z0IFRpbWUtU3RhbXAgU2VydmljZaCCEfswggcoMIIFEKADAgECAhMzAAACEUUY
-# OZtDz/xsAAEAAAIRMA0GCSqGSIb3DQEBCwUAMHwxCzAJBgNVBAYTAlVTMRMwEQYD
+# Hm5TaGllbGQgVFNTIEVTTjo2NTFBLTA1RTAtRDk0NzElMCMGA1UEAxMcTWljcm9z
+# b2Z0IFRpbWUtU3RhbXAgU2VydmljZaCCEfswggcoMIIFEKADAgECAhMzAAACFRgD
+# 04EHJnxTAAEAAAIVMA0GCSqGSIb3DQEBCwUAMHwxCzAJBgNVBAYTAlVTMRMwEQYD
 # VQQIEwpXYXNoaW5ndG9uMRAwDgYDVQQHEwdSZWRtb25kMR4wHAYDVQQKExVNaWNy
 # b3NvZnQgQ29ycG9yYXRpb24xJjAkBgNVBAMTHU1pY3Jvc29mdCBUaW1lLVN0YW1w
-# IFBDQSAyMDEwMB4XDTI1MDgxNDE4NDgxM1oXDTI2MTExMzE4NDgxM1owgdMxCzAJ
+# IFBDQSAyMDEwMB4XDTI1MDgxNDE4NDgyMFoXDTI2MTExMzE4NDgyMFowgdMxCzAJ
 # BgNVBAYTAlVTMRMwEQYDVQQIEwpXYXNoaW5ndG9uMRAwDgYDVQQHEwdSZWRtb25k
 # MR4wHAYDVQQKExVNaWNyb3NvZnQgQ29ycG9yYXRpb24xLTArBgNVBAsTJE1pY3Jv
 # c29mdCBJcmVsYW5kIE9wZXJhdGlvbnMgTGltaXRlZDEnMCUGA1UECxMeblNoaWVs
-# ZCBUU1MgRVNOOjZCMDUtMDVFMC1EOTQ3MSUwIwYDVQQDExxNaWNyb3NvZnQgVGlt
+# ZCBUU1MgRVNOOjY1MUEtMDVFMC1EOTQ3MSUwIwYDVQQDExxNaWNyb3NvZnQgVGlt
 # ZS1TdGFtcCBTZXJ2aWNlMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA
-# z7m7MxAdL5Vayrk7jsMo3GnhN85ktHCZEvEcj4BIccHKd/NKC7uPvpX5dhO63W6V
-# M5iCxklG8qQeVVrPaKvj8dYYJC7DNt4NN3XlVdC/voveJuPPhTJ/u7X+pYmV2qeh
-# TVPOOB1/hpmt51SzgxZczMdnFl+X2e1PgutSA5CAh9/Xz5NW0CxnYVz8g0Vpxg+B
-# q32amktRXr8m3BSEgUs8jgWRPVzPHEczpbhloGGEfHaROmHhVKIqN+JhMweEjU2N
-# XM2W6hm32j/QH/I/KWqNNfYchHaG0xJljVTYoUKPpcQDuhH9dQKEgvGxj2U5/3Fq
-# 1em4dO6Ih04m6R+ttxr6Y8oRJH9ZhZ3sciFBIvZh7E2YFXOjP4MGybSylQTPDEFA
-# tHHgpkskeEUhsPDR9VvWWhekhQx3qXaAKh+AkLmz/hpE3e0y+RIKO2AREjULJAKg
-# f+R9QnNvqMeMkz9PGrjsijqWGzB2k2JNyaUYKlbmQweOabsCioiY2fJbimjVyFAG
-# k5AeYddUFxvJGgRVCH7BeBPKAq7MMOmSCTOMZ0Sw6zyNx4Uhh5Y0uJ0ZOoTKnB3K
-# fdN/ba/eKHFeEhi3WqAfzTxiy0rMvhsfsXZK7zoclqaRvVl8Q48J174+eyriypY9
-# HhU+ohgiYi4uQGDDVdTDeKDtoC/hD2Cn+ARzwE1rFfECAwEAAaOCAUkwggFFMB0G
-# A1UdDgQWBBRifUUDwOnqIcvfb53+yV0EZn7OcDAfBgNVHSMEGDAWgBSfpxVdAF5i
+# w3HV3hVxL0lEYPV03XeNKZ517VIbgexhlDPdpXwDS0BYtxPwi4XYpZR1ld0u6cr2
+# Xjuugdg50DUx5WHL0QhY2d9vkJSk02rE/75hcKt91m2Ih287QRxRMmFu3BF6466k
+# 8qp5uXtfe6uciq49YaS8p+dzv3uTarD4hQ8UT7La95pOJiRqxxd0qOGLECvHLEXP
+# XioNSx9pyhzhm6lt7ezLxJeFVYtxShkavPoZN0dOCiYeh4KgoKoyagzMuSiLCiMU
+# W4Ue4Qsm658FJNGTNh7V5qXYVA6k5xjw5WeWdKOz0i9A5jBcbY9fVOo/cA8i1byt
+# zcDTxb3nctcly8/OYeNstkab/Isq3Cxe1vq96fIHE1+ZGmJjka1sodwqPycVp/2t
+# b+BjulPL5D6rgUXTPF84U82RLKHV57bB8fHRpgnjcWBQuXPgVeSXpERWimt0NF2l
+# COLzqgrvS/vYqde5Ln9YlKKhAZ/xDE0TLIIr6+I/2JTtXP34nfjTENVqMBISWcak
+# IxAwGb3RB5yHCxynIFNVLcfKAsEdC5U2em0fAvmVv0sonqnv17cuaYi2eCLWhoK1
+# Ic85Dw7s/lhcXrBpY4n/Rl5l3wHzs4vOIhu87DIy5QUaEupEsyY0NWqgI4BWl6v1
+# wgse+l8DWFeUXofhUuCgVTuTHN3K8idoMbn8Q3edUIECAwEAAaOCAUkwggFFMB0G
+# A1UdDgQWBBSJIXfxcqAwFqGj9jdwQtdSqadj1zAfBgNVHSMEGDAWgBSfpxVdAF5i
 # XYP05dJlpxtTNRnpcjBfBgNVHR8EWDBWMFSgUqBQhk5odHRwOi8vd3d3Lm1pY3Jv
 # c29mdC5jb20vcGtpb3BzL2NybC9NaWNyb3NvZnQlMjBUaW1lLVN0YW1wJTIwUENB
 # JTIwMjAxMCgxKS5jcmwwbAYIKwYBBQUHAQEEYDBeMFwGCCsGAQUFBzAChlBodHRw
 # Oi8vd3d3Lm1pY3Jvc29mdC5jb20vcGtpb3BzL2NlcnRzL01pY3Jvc29mdCUyMFRp
 # bWUtU3RhbXAlMjBQQ0ElMjAyMDEwKDEpLmNydDAMBgNVHRMBAf8EAjAAMBYGA1Ud
 # JQEB/wQMMAoGCCsGAQUFBwMIMA4GA1UdDwEB/wQEAwIHgDANBgkqhkiG9w0BAQsF
-# AAOCAgEApEKdnMeIIUiU6PatZ/qbrwiDzYUMKRczC4Bp/XY1S9NmHI+2c3dcpwH2
-# SOmDfdvIIqt7mRrgvBPYOvJ9CtZS5eeIrsObC0b0ggKTv2wrTgWG+qktqNFEhQei
-# pdURNLN68uHAm5edwBytd1kwy5r6B93klxDsldOmVWtw/ngj7knN09muCmwr17Jn
-# sMFcoIN/H59s+1RYN7Vid4+7nj8FcvYy9rbZOMndBzsTiosF1M+aMIJX2k3EVFVs
-# uDL7/R5ppI9Tg7eWQOWKMZHPdsA3ZqWzDuhJqTzoFSQShnZenC+xq/z9BhHPFFbU
-# tfjAoG6EDPjSQJYXmogja8OEa19xwnh3wVufeP+ck+/0gxNi7g+kO6WaOm052F4s
-# iD8xi6Uv75L7798lHvPThcxHHsgXqMY592d1wUof3tL/eDaQ0UhnYCU8yGkU2XJn
-# ctONnBKAvURAvf2qiIWDj4Lpcm0zA7VuofuJR1Tpuyc5p1ja52bNZBBVqAOwyDhA
-# mqWsJXAjYXnssC/fJkee314Fh+GIyMgvAPRScgqRZqV16dTBYvoe+w1n/wWs/yST
-# UsxDw4T/AITcu5PAsLnCVpArDrFLRTFyut+eHUoG6UYZfj8/RsuQ42INse1pb/cP
-# m7G2lcLJtkIKT80xvB1LiaNvPTBVEcmNSvFUM0xrXZXcYcxVXiYwggdxMIIFWaAD
+# AAOCAgEAd42HtV+kGbvxzLBTC5O7vkCIBPy/BwpjCzeL53hAiEOebp+VdNnwm9GV
+# CfYq3KMfrj4UvKQTUAaS5Zkwe1gvZ3ljSSnCOyS5OwNu9dpg3ww+QW2eOcSLkyVA
+# WFrLn6Iig3TC/zWMvVhqXtdFhG2KJ1lSbN222csY3E3/BrGluAlvET9gmxVyyxNy
+# 59/7JF5zIGcJibydxs94JL1BtPgXJOfZzQ+/3iTc6eDtmaWT6DKdnJocp8wkXKWP
+# IsBEfkD6k1Qitwvt0mHrORah75SjecOKt4oWayVLkPTho12e0ongEg1cje5fxSZG
+# thrMrWKvI4R7HEC7k8maH9ePA3ViH0CVSSOefaPTGMzIhHCo5p3jG5SMcyO3eA9u
+# EaYQJITJlLG3BwwGmypY7C/8/nj1SOhgx1HgJ0ywOJL9xfP4AOcWmCfbsqgGbCaC
+# 7WH5sINdzfMar8V7YNFqkbCGUKhc8GpIyE+MKnyVn33jsuaGAlNRg7dVRUSoYLJx
+# vUsw9GOwyBpBwbE9sqOLm+HsO00oF23PMio7WFXcFTZAjp3ujihBAfLrXICgGOHP
+# dkZ042u1LZqOcnlr3XzvgMe+mPPyasW8f0rtzJj3V5E/EKiyQlPxj9Mfq2x9himn
+# lXWGZCVPeEBROrNbDYBfazTyLNCOTsRtksOSV3FBtPnpQtLN754wggdxMIIFWaAD
 # AgECAhMzAAAAFcXna54Cm0mZAAAAAAAVMA0GCSqGSIb3DQEBCwUAMIGIMQswCQYD
 # VQQGEwJVUzETMBEGA1UECBMKV2FzaGluZ3RvbjEQMA4GA1UEBxMHUmVkbW9uZDEe
 # MBwGA1UEChMVTWljcm9zb2Z0IENvcnBvcmF0aW9uMTIwMAYDVQQDEylNaWNyb3Nv
@@ -231,41 +352,41 @@ if (Test-Path $tempProjectObjDirName -ErrorAction SilentlyContinue)
 # MIHTMQswCQYDVQQGEwJVUzETMBEGA1UECBMKV2FzaGluZ3RvbjEQMA4GA1UEBxMH
 # UmVkbW9uZDEeMBwGA1UEChMVTWljcm9zb2Z0IENvcnBvcmF0aW9uMS0wKwYDVQQL
 # EyRNaWNyb3NvZnQgSXJlbGFuZCBPcGVyYXRpb25zIExpbWl0ZWQxJzAlBgNVBAsT
-# Hm5TaGllbGQgVFNTIEVTTjo2QjA1LTA1RTAtRDk0NzElMCMGA1UEAxMcTWljcm9z
-# b2Z0IFRpbWUtU3RhbXAgU2VydmljZaIjCgEBMAcGBSsOAwIaAxUAKyp8q2VdgAq1
-# VGkzd7PZwV6zNc2ggYMwgYCkfjB8MQswCQYDVQQGEwJVUzETMBEGA1UECBMKV2Fz
+# Hm5TaGllbGQgVFNTIEVTTjo2NTFBLTA1RTAtRDk0NzElMCMGA1UEAxMcTWljcm9z
+# b2Z0IFRpbWUtU3RhbXAgU2VydmljZaIjCgEBMAcGBSsOAwIaAxUAj6eTejbuYE1I
+# fjbfrt6tXevCUSCggYMwgYCkfjB8MQswCQYDVQQGEwJVUzETMBEGA1UECBMKV2Fz
 # aGluZ3RvbjEQMA4GA1UEBxMHUmVkbW9uZDEeMBwGA1UEChMVTWljcm9zb2Z0IENv
 # cnBvcmF0aW9uMSYwJAYDVQQDEx1NaWNyb3NvZnQgVGltZS1TdGFtcCBQQ0EgMjAx
-# MDANBgkqhkiG9w0BAQsFAAIFAO2DRMEwIhgPMjAyNjA0MTAwOTQzMjlaGA8yMDI2
-# MDQxMTA5NDMyOVowdDA6BgorBgEEAYRZCgQBMSwwKjAKAgUA7YNEwQIBADAHAgEA
-# AgIZizAHAgEAAgISHzAKAgUA7YSWQQIBADA2BgorBgEEAYRZCgQCMSgwJjAMBgor
+# MDANBgkqhkiG9w0BAQsFAAIFAO2DHiIwIhgPMjAyNjA0MTAwNjU4NDJaGA8yMDI2
+# MDQxMTA2NTg0MlowdDA6BgorBgEEAYRZCgQBMSwwKjAKAgUA7YMeIgIBADAHAgEA
+# AgIMKjAHAgEAAgITdzAKAgUA7YRvogIBADA2BgorBgEEAYRZCgQCMSgwJjAMBgor
 # BgEEAYRZCgMCoAowCAIBAAIDB6EgoQowCAIBAAIDAYagMA0GCSqGSIb3DQEBCwUA
-# A4IBAQCFX4T7MWgNlozAQ1z3UkgkQ4jqPW8YJfY+Qrh+VeDbjUXaqeCmHeVnP/Qt
-# AwDhP5vhGT5/a43ffbECDpyifmI1UsDI6FQGKDA+2R47kpWdQCawtB2zGKyfhT7a
-# LI8eWaknvUd9j45opp6M5Hc+VgXbCVuA/gAtRdE3ZvZ1Iq5g7qvEQKalxDu5hn9R
-# m4lrQzppIhZNsx5gRnOjfyz8XKOyltYGds2LIgD9jKDal9+aE5MjKEL32xOAyzEQ
-# 4AtuC1onoaWhfjtrYqMVfKyVJT9dtCzhUfu0R6R+V1fCyDQDTClWBrLlg01O5hwX
-# Rtk2IpPrUkJa4VI4tP5ODehJjG2/MYIEDTCCBAkCAQEwgZMwfDELMAkGA1UEBhMC
+# A4IBAQCa1tQRmQvX0UNYKJNwmBjxUVWBWNVTtldbKvnqfqJFkzH3HelixmRcWh4p
+# vyOdY4oWvxZUMmKOvZOaUbEgrkbE1jzL0lGlsFJSu1d1YZ2uvitAyxb8GQCfiHef
+# 2rzPXBbEWhHmNEh7T2X0yd8r+WyKtoknZgYBb+uhhF7zXtyKfzRKDXDeAziJZDEO
+# 4e5R5Iq8VnYBDczkE52PymbBx535nKaM7d8ZsDeRF8VbUzfEnznoYStjCvAq873M
+# gNulzvteLkqP1hTSvnXb3s7lIU6eEH8+DKXNpke8zPngQNsUeU5lZTzJ75/II6J+
+# U4A/D9BCPVStuoVbTkXeUVPFdmquMYIEDTCCBAkCAQEwgZMwfDELMAkGA1UEBhMC
 # VVMxEzARBgNVBAgTCldhc2hpbmd0b24xEDAOBgNVBAcTB1JlZG1vbmQxHjAcBgNV
 # BAoTFU1pY3Jvc29mdCBDb3Jwb3JhdGlvbjEmMCQGA1UEAxMdTWljcm9zb2Z0IFRp
-# bWUtU3RhbXAgUENBIDIwMTACEzMAAAIRRRg5m0PP/GwAAQAAAhEwDQYJYIZIAWUD
+# bWUtU3RhbXAgUENBIDIwMTACEzMAAAIVGAPTgQcmfFMAAQAAAhUwDQYJYIZIAWUD
 # BAIBBQCgggFKMBoGCSqGSIb3DQEJAzENBgsqhkiG9w0BCRABBDAvBgkqhkiG9w0B
-# CQQxIgQgWNqjiP27P11kFQKy30ZHkioxJH0gAgs5eWQWlA8SuJYwgfoGCyqGSIb3
-# DQEJEAIvMYHqMIHnMIHkMIG9BCAsrTOpmu+HTq1aXFwvlhjF8p2nUCNNCEX/OWLH
-# NDMmtzCBmDCBgKR+MHwxCzAJBgNVBAYTAlVTMRMwEQYDVQQIEwpXYXNoaW5ndG9u
+# CQQxIgQg7SD1ymRYc9L2TSfrw67/41dHebjBgiUqcUWSJXin7BEwgfoGCyqGSIb3
+# DQEJEAIvMYHqMIHnMIHkMIG9BCBwEPR2PDrTFLcrtQsKrUi7oz5JNRCF/KRHMihS
+# Ne7sijCBmDCBgKR+MHwxCzAJBgNVBAYTAlVTMRMwEQYDVQQIEwpXYXNoaW5ndG9u
 # MRAwDgYDVQQHEwdSZWRtb25kMR4wHAYDVQQKExVNaWNyb3NvZnQgQ29ycG9yYXRp
 # b24xJjAkBgNVBAMTHU1pY3Jvc29mdCBUaW1lLVN0YW1wIFBDQSAyMDEwAhMzAAAC
-# EUUYOZtDz/xsAAEAAAIRMCIEINs3oe16hbZqLLRJk27wyJFeg1UbQ2ePz7CHpMz3
-# dvlpMA0GCSqGSIb3DQEBCwUABIICADsn1By9nATgzNKFCqiXl9r84qspInbbQl4i
-# XHKvH9R5thvxUDl6TYpnv2oOgxMu56RmhdpegJoo9bpXlXzvomIE03UotpPxCoVM
-# ZruVAcdZQWejHNwWNsgAvkCFHCldWQmYPrib2JIeCUPnvd4wuVfsH/o3rF3Csza9
-# ul8jYSOhp5LnnahE/zRoTfp59c7MDsPFYUdhJio9GHG6+zMrVmbAwgw7OTr4MXkX
-# oLUQnlDA5uCkYraT4JKi3eHhaxMgUkh2k2zmwVs9vGg0f+rWtuzpQwJ/6C3R39Oe
-# X8dIyn/EudrdkJZZM2kkKIK0sY/tqINRYkEfVKiyMRWd8vXSWPC1D0APyMyINP9t
-# UNu1zufAeUjjMZ282ASeAnW0y9JyP+yCWqD0Xr/TrTkNVQ8bWl5mhIciKfDC+pAi
-# W99BO53F11Gmy5atCTWib31zPbJTmnVh0QHVWsPdeuTcw5bgv1B+K8K3R3N3W87B
-# quNk+SE6XflTyqY1lUpxxc8kZAGniJsdtQwznHP0nSwkrUUwxA5IIUXH6foPzZfd
-# 6c1C8l5UDzqsIXwV5aicXBzUxNIuuKo5VGLCk+BxW0RCKzx7k9Qn23rUnnQkI1g0
-# SNX50iEjYkUg4i47VzgwIUlwEQ0lM6vy9VZB0KVvPITtvvtZ88e983cH+T5j+D7q
-# YSt1O4f4
+# FRgD04EHJnxTAAEAAAIVMCIEIPVxMjtOPkxX3CifR+j2BXAdRDSEZgGWVGszSd01
+# dLicMA0GCSqGSIb3DQEBCwUABIICAK7D6zpfE9kmtBLtKwWrmb/QqVZGDAUiM4Cg
+# Z5sqvzVqIRRlvSM5ZQeqj+XekOju9ToOlM+Yk/MWhpFH258gnEsD0n0oJsa1VGxu
+# lTkp1NhyvCmZhQTniB5oLKfU08WzxaTrSd4EgQjWhd+ibcNWJr8H09Hc+oyFM5Qp
+# BYxGYmfeR7AlVbZyvH73Xt40WJ/5DZ0XeEungEu376RhDikVeE3LGUUaHJJVi4yZ
+# ni/4UtYGZ0nqvG/C8bKUpnrLCr7OHndc3DC1NnOC63cbJF76G0Su61MpGYjID4e2
+# eqxQ7LzsVPNSdbQC/d8RJugbm6zGWBJKtF+q6OfzFiT+eRYYb/QRW9MwoQiCdmw+
+# P2WTNJFOqf5wAnkUvvIP67gsGqzlC2RIEOLtiwJLS63WkNFPTj4BjcCIVnDOX2lX
+# sh7JI7oBUGUvOt+ZSAMhwZ20Qw4C764XM9CpOTFm4GrFmsuVATuhsihyWohpRFLA
+# phOTOAGqiAhIV6Wf2HA4EkyHNh1xaq2X0yBrr6X6//xOwH/o7Y2w0+3wHP9MD3PX
+# a9SqvVKMosMFMQjk/MLgegz+10shAR3Mn2BHLstZdstUUo9zUL+wcjD8Wy9g2ntt
+# yHWhqCyx1nxqXo5b2gMSW/9rJivRE44W1F5JQishOp2TSVIzxAIc1hhckhDXKHWd
+# hVJoExno
 # SIG # End signature block

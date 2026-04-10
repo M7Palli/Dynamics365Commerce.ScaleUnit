@@ -1,59 +1,133 @@
 <#
 .SYNOPSIS
-Restore the nuget package to the specified folder.
+    Downloads a CSU extension package from Dataverse.
+
+.DESCRIPTION
+    Connects to the specified Dataverse environment, queries for a CSU extension
+    package record by name and version, and downloads the package file to the
+    specified output directory.
 
 .PARAMETER PackageName
-The name of package do download.
+    The name of the CSU extension package to download.
 
-.PARAMETER PackageRootFolder
-The download root folder.
+.PARAMETER PackageVersion
+    The version of the CSU extension package to download.
 
-.PARAMETER LatestPackageFolder
-The object containing the path to the package latest version.
+.PARAMETER OutputDirectory
+    The directory to save the downloaded package file to.
 
-.PARAMETER CommandExitCode
-The exit code of the RestorePackage.ps1 script.
+.PARAMETER EnvironmentUrl
+    The Dataverse environment URL (e.g., https://myorg.crm.dynamics.com/).
+
+.PARAMETER TenantId
+    Azure AD tenant ID.
+
+.PARAMETER ClientId
+    Azure AD application (client) ID.
+
+.PARAMETER ClientSecret
+    Azure AD application client secret. Required if CertificateThumbprint is not provided.
+
+.PARAMETER CertificateThumbprint
+    Thumbprint of a certificate for authentication. Preferred over ClientSecret when both are provided.
 #>
-[CmdletBinding()]
-param(
-    [string]
+param (
+    [Parameter(Mandatory)]
+    [ValidateNotNullOrEmpty()]
+    [String]
     $PackageName,
 
-    [string]
-    $PackageRootFolder,
+    [Parameter(Mandatory)]
+    [ValidateNotNullOrEmpty()]
+    [String]
+    $PackageVersion,
 
-    [ref]
-    $LatestPackageFolder,
+    [Parameter(Mandatory)]
+    [ValidateScript({ Test-Path $_ -PathType Container })]
+    [String]
+    $OutputDirectory,
 
-    [ref]
-    $CommandExitCode
+    [Parameter(Mandatory)]
+    [ValidateNotNullOrEmpty()]
+    [String]
+    $EnvironmentUrl,
+
+    [Parameter(Mandatory)]
+    [ValidateNotNullOrEmpty()]
+    [String]
+    $TenantId,
+
+    [Parameter(Mandatory)]
+    [ValidateNotNullOrEmpty()]
+    [String]
+    $ClientId,
+
+    [Parameter()]
+    [String]
+    $ClientSecret,
+
+    [Parameter()]
+    [String]
+    $CertificateThumbprint
 )
-Import-Module (Join-Path $PSScriptRoot "ErrorDecorator.psm1")
 
-$workspaceFolder = $Env:common_workspaceFolder
+$ErrorActionPreference = 'Stop'
 
-$scriptPath = Join-Path (Join-Path $workspaceFolder "Scripts") "RestorePackage.ps1"
-& $scriptPath $PackageName $PackageRootFolder
+Write-Host "Starting CSU extension package download...`n"
 
-# Provide an exit code
-$CommandExitCode.value = $LastExitCode
+# ── Load Dataverse client modules ────────────────────────────────────────────
+. $PSScriptRoot\Common\Core.ps1
+. $PSScriptRoot\Common\CommonFunctions.ps1
+. $PSScriptRoot\Operations\ExtensionPackageOperations.ps1
 
-$PackagePath = Join-Path (Join-Path $PackageRootFolder $PackageName) "*"
-$IsPreviewExpression = @{label="IsPreview";expression={$_.Name -match '-preview'}}
-$VersionExpression = @{label="Version";expression={[Version]([regex]::Matches($_.Name,'(\d+\.)+\d+(?=-preview)*').Value)}}
+# ── Connect to Dataverse ─────────────────────────────────────────────────────
+$connectParams = @{
+    environmentUrl = $EnvironmentUrl
+    tenantId       = $TenantId
+    clientId       = $ClientId
+}
+if ($CertificateThumbprint) { $connectParams.certificateThumbprint = $CertificateThumbprint }
+elseif ($ClientSecret)      { $connectParams.clientSecret = $ClientSecret }
 
-# Preview version should get a lower priority than the regular versions, we sort descending by a version and then by '-not IsPreview'
-$LatestPackageFolder.Value = Get-ChildItem -Path $PackagePath -Directory -ErrorAction SilentlyContinue | Select-Object FullName,Name,$VersionExpression,$IsPreviewExpression | Sort-Object -Property Version,{-not $_.IsPreview} -Descending | Select-Object -First 1
+Connect @connectParams | Out-Null
 
-# The package folder may contain the package contents downloaded earlier,
-# return it to the calling code along with the exit code.
-# Let the calling code deside if it will use the folder we found or throw an error.
+Write-Host "Connected as: $((Get-WhoAmI).UserId)`n"
+
+# ── Query package record ─────────────────────────────────────────────────────
+$records = Get-CsuExtensionPackage -PackageName $PackageName -PackageVersion $PackageVersion
+
+if (-not $records) {
+    throw "No CSU extension package found: $PackageName ($PackageVersion)"
+}
+
+if ($records.Count -gt 1) {
+    throw "Expected 1 record but found $($records.Count) for: $PackageName ($PackageVersion). Data may be inconsistent."
+}
+
+$record = $records[0]
+$packageId = [System.Guid]::new($record.msprov_commerceextensionassetid)
+
+Write-Host "Package record:"
+Write-Host "  ID:          $packageId"
+Write-Host "  Name:        $($record.msprov_name)"
+Write-Host "  Publisher:   $($record.msprov_publisher)"
+Write-Host "  Version:     $($record.msprov_version)"
+Write-Host "  SDK Version: $($record.msprov_sdkversion)"
+if ($record.msprov_description) {
+    Write-Host "  Description: $($record.msprov_description)"
+}
+Write-Host ""
+
+# ── Download package file ────────────────────────────────────────────────────
+$file = Get-CsuExtensionPackageFile -PackageId $packageId -OutputDirectory $OutputDirectory
+
+Write-Host "SUCCESS: CSU extension package downloaded - $PackageName ($PackageVersion) -> $($file.FullName)`n" -ForegroundColor Green
 
 # SIG # Begin signature block
 # MIIoKgYJKoZIhvcNAQcCoIIoGzCCKBcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDQc+vlcClkvBnM
-# PlRxzHoMMNLerdU0cL5Vxcw/8VHFh6CCDXYwggX0MIID3KADAgECAhMzAAAEhV6Z
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDhvM0psM96Z/Zk
+# lTxbgwJw9b4msVqO7vwZEqBh5DWjc6CCDXYwggX0MIID3KADAgECAhMzAAAEhV6Z
 # 7A5ZL83XAAAAAASFMA0GCSqGSIb3DQEBCwUAMH4xCzAJBgNVBAYTAlVTMRMwEQYD
 # VQQIEwpXYXNoaW5ndG9uMRAwDgYDVQQHEwdSZWRtb25kMR4wHAYDVQQKExVNaWNy
 # b3NvZnQgQ29ycG9yYXRpb24xKDAmBgNVBAMTH01pY3Jvc29mdCBDb2RlIFNpZ25p
@@ -130,62 +204,62 @@ $LatestPackageFolder.Value = Get-ChildItem -Path $PackagePath -Directory -ErrorA
 # aWNyb3NvZnQgQ29ycG9yYXRpb24xKDAmBgNVBAMTH01pY3Jvc29mdCBDb2RlIFNp
 # Z25pbmcgUENBIDIwMTECEzMAAASFXpnsDlkvzdcAAAAABIUwDQYJYIZIAWUDBAIB
 # BQCgga4wGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEO
-# MAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIIQQu+5ItIFgR2WWqyGAn18d
-# k3lfhDbEZC1CzszZ6IamMEIGCisGAQQBgjcCAQwxNDAyoBSAEgBNAGkAYwByAG8A
+# MAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIJ6UqKCtxGCVintucA5A2a7A
+# FcfKDXngdOd6kPpBtcs8MEIGCisGAQQBgjcCAQwxNDAyoBSAEgBNAGkAYwByAG8A
 # cwBvAGYAdKEagBhodHRwOi8vd3d3Lm1pY3Jvc29mdC5jb20wDQYJKoZIhvcNAQEB
-# BQAEggEAu5CbJV9pTNMmFz0oxklMKka2dmDL9SsgFWJE1e6AzLiMtP9rZoDYskTr
-# leLGwwWqisKPtlrxlxR4CYvcwFiYONxHN+DIrqGr4/jjYhQs+AE/oXwbkMIUrrPK
-# KJn0vz5xDklfxjY0Clm9R/ZNoV9hPi7ky0ykRpe1s5JrcrYtr6IiwPQTLnVV0AU5
-# Zi4J1ZivlugYTZHFK1qadk9FCEUqOVjo5jAqsoUf33MtkVZTv8jAqh/0JSPmQxCL
-# EFMMdIQs3F2K6Qi9qyicyLaSP+gDBF8dHhQlMvpoKy+q/mrOkTLSteI5wW5w1/fn
-# EhGb3sseURKKFB57DSO7l3eBNORnrKGCF5QwgheQBgorBgEEAYI3AwMBMYIXgDCC
+# BQAEggEAkeIS9x/pbwG0rm38WGroEf1XUGXbIlC4IGrc34cnFhhR/exYlzyhdv20
+# yRV7ulI4sBjS7WyUt2InZ7TSGIObYxHWoYMzvPjqhX0wKBk5LcCnxuq/Pqqz0Sp6
+# 6zV3i/i6+YjSwz6B2I536wbP9fvkij3EY/ArMjJ1hU/lmLF99S3kygk8zsVjXxt2
+# aqw3/nMRTzZYFplAFIGJIddN2SIGQYCI3hoUSZp0PyYe/qPfBQNJarXSpgKw6iVi
+# ikLbeHVakiRGgWY4HBY6V/r4/txyAOWg+UqpXmWNEZq2Qi5Wlh0HBzRfwOmwSXnQ
+# Kf/oKf45wNHap7dVo6fwbyMhBQ+HKaGCF5QwgheQBgorBgEEAYI3AwMBMYIXgDCC
 # F3wGCSqGSIb3DQEHAqCCF20wghdpAgEDMQ8wDQYJYIZIAWUDBAIBBQAwggFSBgsq
 # hkiG9w0BCRABBKCCAUEEggE9MIIBOQIBAQYKKwYBBAGEWQoDATAxMA0GCWCGSAFl
-# AwQCAQUABCDRaMUXwzFelssQ1+/2fYzGEtRTTufGun55X/3mdyprvAIGadgYb9En
-# GBMyMDI2MDQxMDEwMTIxNC44MTRaMASAAgH0oIHRpIHOMIHLMQswCQYDVQQGEwJV
+# AwQCAQUABCCWeH/ZVxA81jAg15Ki0U+v7wDBdVoVRyr+7iRsv1VasAIGadexHIvZ
+# GBMyMDI2MDQxMDEwMTIxMy41MDVaMASAAgH0oIHRpIHOMIHLMQswCQYDVQQGEwJV
 # UzETMBEGA1UECBMKV2FzaGluZ3RvbjEQMA4GA1UEBxMHUmVkbW9uZDEeMBwGA1UE
 # ChMVTWljcm9zb2Z0IENvcnBvcmF0aW9uMSUwIwYDVQQLExxNaWNyb3NvZnQgQW1l
-# cmljYSBPcGVyYXRpb25zMScwJQYDVQQLEx5uU2hpZWxkIFRTUyBFU046N0YwMC0w
-# NUUwLUQ5NDcxJTAjBgNVBAMTHE1pY3Jvc29mdCBUaW1lLVN0YW1wIFNlcnZpY2Wg
-# ghHqMIIHIDCCBQigAwIBAgITMwAAAh6jrKRuOW98SQABAAACHjANBgkqhkiG9w0B
+# cmljYSBPcGVyYXRpb25zMScwJQYDVQQLEx5uU2hpZWxkIFRTUyBFU046QTkzNS0w
+# M0UwLUQ5NDcxJTAjBgNVBAMTHE1pY3Jvc29mdCBUaW1lLVN0YW1wIFNlcnZpY2Wg
+# ghHqMIIHIDCCBQigAwIBAgITMwAAAifVwIPDsS5XLQABAAACJzANBgkqhkiG9w0B
 # AQsFADB8MQswCQYDVQQGEwJVUzETMBEGA1UECBMKV2FzaGluZ3RvbjEQMA4GA1UE
 # BxMHUmVkbW9uZDEeMBwGA1UEChMVTWljcm9zb2Z0IENvcnBvcmF0aW9uMSYwJAYD
-# VQQDEx1NaWNyb3NvZnQgVGltZS1TdGFtcCBQQ0EgMjAxMDAeFw0yNjAyMTkxOTM5
-# NDlaFw0yNzA1MTcxOTM5NDlaMIHLMQswCQYDVQQGEwJVUzETMBEGA1UECBMKV2Fz
+# VQQDEx1NaWNyb3NvZnQgVGltZS1TdGFtcCBQQ0EgMjAxMDAeFw0yNjAyMTkxOTQw
+# MDRaFw0yNzA1MTcxOTQwMDRaMIHLMQswCQYDVQQGEwJVUzETMBEGA1UECBMKV2Fz
 # aGluZ3RvbjEQMA4GA1UEBxMHUmVkbW9uZDEeMBwGA1UEChMVTWljcm9zb2Z0IENv
 # cnBvcmF0aW9uMSUwIwYDVQQLExxNaWNyb3NvZnQgQW1lcmljYSBPcGVyYXRpb25z
-# MScwJQYDVQQLEx5uU2hpZWxkIFRTUyBFU046N0YwMC0wNUUwLUQ5NDcxJTAjBgNV
+# MScwJQYDVQQLEx5uU2hpZWxkIFRTUyBFU046QTkzNS0wM0UwLUQ5NDcxJTAjBgNV
 # BAMTHE1pY3Jvc29mdCBUaW1lLVN0YW1wIFNlcnZpY2UwggIiMA0GCSqGSIb3DQEB
-# AQUAA4ICDwAwggIKAoICAQCl0TjtbDwsR7Fe8ac6ol5s1zhtTqd2AWpchQhLp9G5
-# mmSM23N5fyQGCQ1D06rOA3PgXKF+76vXvOCs2VsLv1owj4mHEyEqiq8GJ5yC+/QN
-# YRpZPA8e7OgekzDO6S/4vy/jTMYbp3rhuFiKKCzTWOQtdFcF+D0k369I7pm/E07S
-# yNMGkuNd5lj5SJ91UqFuZfjMB6cQ2wh77mtiRUVdj53yjdNqj+GQl+Yaz29Bjrzn
-# 7U1ln+JpLlnb0xdGmZoIPKZbwBVcWtyL4uyhML7SSTmiOfWXU+g+yNl0CdoLGL8L
-# tWHEi8FsuTPeSdSqmeMrvLaEmibTVTS4vQQY8NPnb6uI5y6iNV9vBFcm8LU/lDTj
-# GTqPa7UBT4gdf5Jm3wYrfCFZ4P/j5MoqT0JONca50jt4TGI90SihXaDEYqk23S0I
-# JZ3UkUpukDRTjK713BIykffxyBqMeQqfO0zvWfUx7BrmUpugQcw99+DxLl2gf+uQ
-# EpRmnlbrVJ9dvW9ds4fqEPN2jG0QwF1PBSglNcV1SpqZKitQgBGSwu/82AKztoCH
-# wYRHRNwzwTVe/1KNTvmqAd4Uges4ywOH02haagT8wYY8OdWdjKn3k052w+kmc0UC
-# 0F+iVXTGZIMxvo9iBZQoXehzRtWJ/VOtKvCyS3csKzN7rStWJwjSWz6dtOf0l+yt
-# LQIDAQABo4IBSTCCAUUwHQYDVR0OBBYEFOYKFprqBB0JZmJcFC4cPPmeF4JkMB8G
+# AQUAA4ICDwAwggIKAoICAQDixWy1fDOSL4qj3A1pady+elIDLwnF3UuLzJIOWwGH
+# cEgrxxwtnyviUIDmmxylTUl1u+2rBPp2zT4BwwQhvGaJpExqvPLlDFlbfmSflKI8
+# 6eFqofiZ7j8NTRO4l7wGg9Njm+muNauTcFW2qdfIjKE950Okrm9MnMOGYy+fibNY
+# dxTPRPq1T4MLZK3s3vdMyMEOldcOQkSKpxD6/1Gk6gOmCu2KgI8f0ex6vYxnKDl9
+# W0OLSEa/6y82oIbsm+1QBifOQ47xWKTG1CmvtGr85LzA75/MAcUmRw5/of/qET0U
+# FV1WulMcJrI6DASAsNCNB+6WLrotuBZAj+VMlqbn5RMZ6Q4IY7JwaAiIXh7Vjxrn
+# wUOYZG8WEGhfrA98di+7LEn9AqvvEOyG+UQcjVhCCbMGXigJXSApeyeWupCsD0jg
+# QMNCxfB5BLBDWxgdY3dJBEPgxfkgTDQLBggtVv2d5CYxHKgIItB4bI5eSb5jkIG2
+# WotnFetT0legpw/Eozwf39ao6tENY21eVWIzRw/GsmvwjYQF6vVrxOD0pGVsfqGF
+# 8s3VPeY7hI2TxHFMqNA0IB/a2NLY7JTxYAKAP/11EJZt7xbqDLMgD1YDdGEzGpQi
+# jm3nAPCL2CebP/jmu90abJ2W425yglGHTI/nCBrwSpfRCgwzrfFelJaCKM6+35aF
+# fwIDAQABo4IBSTCCAUUwHQYDVR0OBBYEFNLW58N4MGSG6ud7jWqgT92orfReMB8G
 # A1UdIwQYMBaAFJ+nFV0AXmJdg/Tl0mWnG1M1GelyMF8GA1UdHwRYMFYwVKBSoFCG
 # Tmh0dHA6Ly93d3cubWljcm9zb2Z0LmNvbS9wa2lvcHMvY3JsL01pY3Jvc29mdCUy
 # MFRpbWUtU3RhbXAlMjBQQ0ElMjAyMDEwKDEpLmNybDBsBggrBgEFBQcBAQRgMF4w
 # XAYIKwYBBQUHMAKGUGh0dHA6Ly93d3cubWljcm9zb2Z0LmNvbS9wa2lvcHMvY2Vy
 # dHMvTWljcm9zb2Z0JTIwVGltZS1TdGFtcCUyMFBDQSUyMDIwMTAoMSkuY3J0MAwG
 # A1UdEwEB/wQCMAAwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwgwDgYDVR0PAQH/BAQD
-# AgeAMA0GCSqGSIb3DQEBCwUAA4ICAQCkoZB5NnJVFb5wKejRonk518a2TBNYpKcB
-# MtfL6BS0ARaABOMGYLlPNuhI1HwmelP9hX3oq3TaEm/cDkkzNQAzDedPgoRI2R7+
-# 8poNSWvHXEAs7SZODm9x7KqlBkNZM9ex4XY1yNmVOAmWDjRr7jKjaiQbntf7EC4G
-# NikxGGaVWOjfYt3Q9X0r/Ks8KBlbzDR9zjA/TCctR4co1WpU1ZRLFrB9bl8dRxsb
-# nyT2qQ41E7dT12R30eIGUziEs5GN+26V/ovXOi20dJiM13hYWvy1NNJAhkKOlLB1
-# ONund6ffhPdUcHWsu8V+lR0aakMV64HqDbLumZrCNwUofVx3xMk8F4tCYJtQxLTy
-# wc30sZAD1S2sC1959x6KixA+p41FLUl8g64oHy3bfYnH5xd4JOBgQoaqndGjcctx
-# r+8EknjhKyrgAzrTcKLJbUezgoye8brCLJ+y6PAoEjpXRkSYAU8wfQ3YWRck6ALw
-# oV7Uin8+rpGQSbXhF6c1dTFakXmChClud4IADY/t6JRkJ+06FzL+jDd8KLV8Qj77
-# JfiuTiPIG5G/xlnGoZFcX+yyBtDvzZE48d+Y+HYUd/cvhH1FKl7AH+5AyotqJSFm
-# vM/BuYRx2B20asVXilV2k2JbNO3LGCz3Q+dpElzwsfJrka1N/getma7fWpowsNvo
-# IaEQvjad8TCCB3EwggVZoAMCAQICEzMAAAAVxedrngKbSZkAAAAAABUwDQYJKoZI
+# AgeAMA0GCSqGSIb3DQEBCwUAA4ICAQAqncud4PSC1teb2H6nRuy7sDiKK13FXJir
+# VB4Tfwjdo2Mb+QL4j7wZ/k4G9P0CANHZFrDQcK0VFDTysrYu8Z0Aha14acDZPsyI
+# oPvAGRRhaHEuf7NckRjkfa/ylo1KyII8jbL9N9sJAqBPL8V4FNBjljv+1GHDOw12
+# 7rZz5ZSTPoAPb2SA0v5yDgcpUMfxglPyp6cnPPoQpTtD9OGx8Dwm2P+o1TPxBIy6
+# I0T9RauulogVCvKwflfeLTcKAvnSG1rCjerSXmU1DNXOsAD/bsrSjgbX5mAbD7XT
+# RMF/vawAWESFcn/BjjizxeWZb00aYSlkJA2rVtFlMM481aVWXdAbXPP5RzUiWTlg
+# yHf/G7lCxHYWGIZuB13T3aI6Y8mEgn/ou40aiFJo8r0+i0P5GdNneWtxiR0CMKUf
+# ko+5s/73cwe1Wfp8BKXa270cicVQasFf5sRV7pFm+V7fNRXwCu7anTOmga76zO7/
+# 2t+zOlibvphT+Q6Zd+B2qYsSn4xBaY+YzHpnycLW5cvJyhPxBCcb1oRYfhRzCADb
+# 2utI2EtGCjc2P2ii4LyR4QMb/n8cOweL9IqVTKKzzVk+zZJxV3vrp4LyuQXw0O30
+# la6BcHdNAAAB9UC83zs3G9d+AlIfZLM97tMUNKWjbBpIirFx6LTDFXVtZQd7hqzL
+# YByjbjH0ujCCB3EwggVZoAMCAQICEzMAAAAVxedrngKbSZkAAAAAABUwDQYJKoZI
 # hvcNAQELBQAwgYgxCzAJBgNVBAYTAlVTMRMwEQYDVQQIEwpXYXNoaW5ndG9uMRAw
 # DgYDVQQHEwdSZWRtb25kMR4wHAYDVQQKExVNaWNyb3NvZnQgQ29ycG9yYXRpb24x
 # MjAwBgNVBAMTKU1pY3Jvc29mdCBSb290IENlcnRpZmljYXRlIEF1dGhvcml0eSAy
@@ -228,41 +302,41 @@ $LatestPackageFolder.Value = Get-ChildItem -Path $PackagePath -Directory -ErrorA
 # MIICNQIBATCB+aGB0aSBzjCByzELMAkGA1UEBhMCVVMxEzARBgNVBAgTCldhc2hp
 # bmd0b24xEDAOBgNVBAcTB1JlZG1vbmQxHjAcBgNVBAoTFU1pY3Jvc29mdCBDb3Jw
 # b3JhdGlvbjElMCMGA1UECxMcTWljcm9zb2Z0IEFtZXJpY2EgT3BlcmF0aW9uczEn
-# MCUGA1UECxMeblNoaWVsZCBUU1MgRVNOOjdGMDAtMDVFMC1EOTQ3MSUwIwYDVQQD
-# ExxNaWNyb3NvZnQgVGltZS1TdGFtcCBTZXJ2aWNloiMKAQEwBwYFKw4DAhoDFQCD
-# /QNkKDIW4VIF7j3oi2qbrR0a/6CBgzCBgKR+MHwxCzAJBgNVBAYTAlVTMRMwEQYD
+# MCUGA1UECxMeblNoaWVsZCBUU1MgRVNOOkE5MzUtMDNFMC1EOTQ3MSUwIwYDVQQD
+# ExxNaWNyb3NvZnQgVGltZS1TdGFtcCBTZXJ2aWNloiMKAQEwBwYFKw4DAhoDFQAj
+# HzqthPwO0GDckDMA6x54lIiMKqCBgzCBgKR+MHwxCzAJBgNVBAYTAlVTMRMwEQYD
 # VQQIEwpXYXNoaW5ndG9uMRAwDgYDVQQHEwdSZWRtb25kMR4wHAYDVQQKExVNaWNy
 # b3NvZnQgQ29ycG9yYXRpb24xJjAkBgNVBAMTHU1pY3Jvc29mdCBUaW1lLVN0YW1w
-# IFBDQSAyMDEwMA0GCSqGSIb3DQEBCwUAAgUA7YM/nTAiGA8yMDI2MDQxMDA5MjEz
-# M1oYDzIwMjYwNDExMDkyMTMzWjB0MDoGCisGAQQBhFkKBAExLDAqMAoCBQDtgz+d
-# AgEAMAcCAQACAgcCMAcCAQACAhJaMAoCBQDthJEdAgEAMDYGCisGAQQBhFkKBAIx
+# IFBDQSAyMDEwMA0GCSqGSIb3DQEBCwUAAgUA7YLYOzAiGA8yMDI2MDQxMDAyMDAy
+# N1oYDzIwMjYwNDExMDIwMDI3WjB0MDoGCisGAQQBhFkKBAExLDAqMAoCBQDtgtg7
+# AgEAMAcCAQACAjh0MAcCAQACAhIgMAoCBQDthCm7AgEAMDYGCisGAQQBhFkKBAIx
 # KDAmMAwGCisGAQQBhFkKAwKgCjAIAgEAAgMHoSChCjAIAgEAAgMBhqAwDQYJKoZI
-# hvcNAQELBQADggEBABFDOkrZAqswp+Wdi/5OSgFD+uHelZD4NpgoGrbg16Mu+eJp
-# KiebOJf7F1fnir2AnwGXhqzHQbrSjOeEii+3CHQ7gRwkM7+X9L54D2sJZQXPHUWp
-# defJ9RXTwtdDRu57ibK2cGK3GiKkXbiB+stI0iXvOjyns1/53EHgAO1tmMp0YJV6
-# hH9sMSjDYjoHlzFVTT0rzF81nDQQQfHuQLd3fFT72dhiW7vD7PNWASrlvc9mzKXQ
-# yZLu5ISGGS5dLv6yCl6bPMirGqbY3dZSwV2pWk+nLu2ArRk7MOQBJwWDv+0C8M8v
-# eFnznGCbTvJoZ5+mY4xzH5JnWGclbD1+OK/e3MQxggQNMIIECQIBATCBkzB8MQsw
+# hvcNAQELBQADggEBAIUEAtoxcBcWz13LaRAILIUhJQS/LZNhM/M5g2S+6aDsr+xY
+# j4eaW/YFrsbA3Swr1+QJXlgvWJplcf0YXtn5ii6lKzTzIr96Z9XVeJuMaOCQZ1FT
+# aoyYB19Hv+1mltEhKeINhUdIzDrPucvrXNYfIsjeW1GhqWZPAXsY7Fm24mZ7rroY
+# hL3jOlT4uItnqSY5ePU/5sV/cBlbk8wiyPN0TO83WJ2o4UoqkTUdKLqTKV/BqIQi
+# iYcqWk+8yJ27f65O+d8s0hZ3XgNKb5sDl0Yhei8MFIweqmSqsuG3DABnPxYBzWmK
+# I12ylFpWjzv2UWKFANW238rMILvwgAHx+1fgFX8xggQNMIIECQIBATCBkzB8MQsw
 # CQYDVQQGEwJVUzETMBEGA1UECBMKV2FzaGluZ3RvbjEQMA4GA1UEBxMHUmVkbW9u
 # ZDEeMBwGA1UEChMVTWljcm9zb2Z0IENvcnBvcmF0aW9uMSYwJAYDVQQDEx1NaWNy
-# b3NvZnQgVGltZS1TdGFtcCBQQ0EgMjAxMAITMwAAAh6jrKRuOW98SQABAAACHjAN
+# b3NvZnQgVGltZS1TdGFtcCBQQ0EgMjAxMAITMwAAAifVwIPDsS5XLQABAAACJzAN
 # BglghkgBZQMEAgEFAKCCAUowGgYJKoZIhvcNAQkDMQ0GCyqGSIb3DQEJEAEEMC8G
-# CSqGSIb3DQEJBDEiBCD0rP7SDD5/lv9sfbdTXmqJOO+BkbiDlRHqnvyXbao3rDCB
-# +gYLKoZIhvcNAQkQAi8xgeowgecwgeQwgb0EIC+BXWrz9geMgM8Bvn8bqxHjhHXJ
-# 29EBizITIw0B9vOCMIGYMIGApH4wfDELMAkGA1UEBhMCVVMxEzARBgNVBAgTCldh
+# CSqGSIb3DQEJBDEiBCCakrl5UHTH6HmhpvmBxXf/h/gptDfkXtpHijY15k4oLzCB
+# +gYLKoZIhvcNAQkQAi8xgeowgecwgeQwgb0EIOXnARo1oVIcOLJKDqlE0adq/jZ9
+# TXdlnXWRcXGThBFyMIGYMIGApH4wfDELMAkGA1UEBhMCVVMxEzARBgNVBAgTCldh
 # c2hpbmd0b24xEDAOBgNVBAcTB1JlZG1vbmQxHjAcBgNVBAoTFU1pY3Jvc29mdCBD
 # b3Jwb3JhdGlvbjEmMCQGA1UEAxMdTWljcm9zb2Z0IFRpbWUtU3RhbXAgUENBIDIw
-# MTACEzMAAAIeo6ykbjlvfEkAAQAAAh4wIgQgi0kynQmklMHno5Hl9J4Bblsg4pwT
-# 2q/XDKrPmdCQSk0wDQYJKoZIhvcNAQELBQAEggIAnaHgltl/769ficjes43iUcW/
-# QBYzwUkL/pj1tV04BLYp7z6Pe8J4yFaQktq4Cqz5OpBx8+4crhGobxuD7/cUO+Ob
-# 3ZtIs2+JvUNDgtSl9cCBlk+Te+w9pAnbVp9mRH5k6yxYJJf3QoRuiWQBRUY3dcAK
-# Hg42DvZTkn/4LRkGk0HQOecN8Nfb8VxIUjVMNti/1qxYVvbw3KKd2iGejZik+ETG
-# MlpAyoUsQ6s9b6ClJVhGXCaSvobmNham6155FZaYm+M2sIkjLM4L/LGtMmMYER0v
-# K2E7xB/oPBPPsTcDhopthK0HGmx5HCksI/EcyI7rGDc8v3mUDrvyqG7XEFdEclUX
-# vD25Xc4pK13z0K2Qq1cPkvc6E5k6Qm9eJHSPhvsv0Y6E1NW5q9HPqMDl6rvvc8Q2
-# +THYcyPOWYhNS7S8k/lHV3et987MBJDuMbu4UmMv4fiVFEJOR9hEnw8BJfgdZsZb
-# Lz1LoniQKhtWowtyfM0ewiBaYDce6UP8VrmM1Ip2AQzDd5MVRYfpxppkkdpRbR67
-# a6rvaBntE+NSuwHu6oUSLqY67RJX2C7mM1Fev1OkQ7ga9MJjaJ9FbICrS+jMKBh1
-# fBM8ieJI1sMHy9cFy9ogjhZVba+dQTg3QJmbbSRDWFaKjbuhetJ3Ie90L8D0cy7G
-# siMlkTvwCMUifHcob/A=
+# MTACEzMAAAIn1cCDw7EuVy0AAQAAAicwIgQgA/56oCdCq63vxdMJXWdAzi5M51lV
+# lfjl/YKzDMCXD0wwDQYJKoZIhvcNAQELBQAEggIAHxGUaBqVhCmN1TiJIBiVL3z9
+# Li8NuR4GCFjENGEWGRhAy1cHY6eH8WrZY3Do3ukNefHGI2ZFNDZjWH4MxIQAPwx5
+# YfeOd/T6UpcVlUnckLbFSThhimGNoCXjZU60l2Mb/vpYJUNBVxIfib8c3F4flTXj
+# Adx/mvRamR9o/yhQlD8eKsiyeY5bYJ/K/Y5iiODh/hSFuw7d3Q4EZwdWJpzfBzFT
+# vHvEK/RSoAVjSCUytRmYg9zT2ppncnyOQ2pepPRWmgBr7k5TA5sy/zkMZrMSr/6x
+# VOBdUPCODepJT5QRE2Yoz1dfUQRIHkv8KGlePi5Bz1sO0+t65y+SIUBCoaMbFq1h
+# kbLEO+yqGEWPWmxSIjdF15GoNYfro9F8iyHzDo2IE5Be1qGtyJkHo5IZpKVVx7RK
+# gRT9kWU1eZMoS70S5tYxcX6i5YmnwfPzrEAuKG1IRcYTfqzf7Ouysr4ZNArFFFmx
+# x5mTaO4tY7wSVfVP3BV6DYOVBkdIRwwfu04FhGA8HJC6tYuH1r0//0bLjqErudIM
+# aTdwf6zOJJugF4E3FvqoVbsdM35b387DMXucgGZO0c4fK4Cd1ms94iUoDGzCwFTx
+# BtggSBwmJqLgPP2C07SKp9LhKwny1MEDZn9xRWiXsMEBGseZuU7ZsCPTA9S4T5VS
+# OxBz3b+JxHau6st6pGo=
 # SIG # End signature block
