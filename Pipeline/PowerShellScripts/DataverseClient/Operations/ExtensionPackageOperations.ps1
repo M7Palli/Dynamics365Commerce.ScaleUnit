@@ -1,61 +1,182 @@
-<#
-.SYNOPSIS
-Restore the nuget package to the specified folder.
+. $PSScriptRoot\TableOperations.ps1
+. $PSScriptRoot\FileOperations.ps1
 
-.PARAMETER PackageName
-The name of package do download.
+function New-CsuExtensionPackage {
+    param (
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $PackageName,
 
-.PARAMETER PackageRootFolder
-The download root folder.
-#>
-[CmdletBinding()]
-param(
-    [string]
-    $PackageName,
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $PackagePublisher,
 
-    [string]
-    $PackageRootFolder
-)
-Import-Module (Join-Path $PSScriptRoot "ErrorDecorator.psm1")
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $PackageVersion,
 
-$tempProjectFileName = Join-Path $PackageRootFolder "Temporary.csproj"
-if (Test-Path $tempProjectFileName -ErrorAction SilentlyContinue)
-{
-    Remove-Item -Force $tempProjectFileName
+        [Parameter()]
+        [String]
+        $SdkVersion,
+
+        [Parameter()]
+        [ValidateSet('Valid', 'Invalid')]
+        [String]
+        $ValidationStatus,
+
+        [Parameter()]
+        [String]
+        $PackageDescription
+    )
+
+    try {
+        $body = @{
+            msprov_name       = $PackageName
+            msprov_publisher  = $PackagePublisher
+            msprov_version    = $PackageVersion
+            msprov_sdkversion = $SdkVersion
+            msprov_assettype  = 0 # CSU Extension Package
+        }
+
+        # Add optional fields if provided
+        if ($ValidationStatus) {
+            $statusValue = switch ($ValidationStatus) {
+                'Valid'   { 202570000 }
+                'Invalid' { 202570001 }
+            }
+            $body['msprov_commerceextensionasset_validationstatus'] = $statusValue
+        }
+
+        if ($PackageDescription) {
+            $body['msprov_description'] = $PackageDescription
+        }
+
+        Write-Host "Creating CSU extension package record: $PackageName ($PackageVersion)"
+
+        $recordId = New-Record -setName 'msprov_commerceextensionassets' -body $body
+
+        Write-Host "Successfully created CSU extension package record with ID: $recordId`n" -ForegroundColor Green
+        return $recordId
+    }
+    catch {
+        Write-Error "Failed to create CSU extension package record $PackageName ($PackageVersion): $($_.Exception.Message)`n"
+        throw
+    }
 }
 
-# Since the "dotnet add package" command does not operate on the package level (only at project or solution level),
-# create a temporary project and add a package to it specifying the $PackageRootFolder folder to store the package.
-$tempProjectContent = "<Project Sdk='Microsoft.NET.Sdk'><PropertyGroup><TargetFramework>netstandard2.0</TargetFramework></PropertyGroup></Project>"
-$tempProjectContent | Out-File $tempProjectFileName
+function Set-CsuExtensionPackageFile {
+    param (
+        [Parameter(Mandatory)]
+        [System.Guid]
+        $PackageId,
 
-& dotnet add $tempProjectFileName package $PackageName --package-directory $PackageRootFolder --prerelease --interactive
+        [Parameter(Mandatory)]
+        [ValidateScript({ Test-Path $_ -PathType Leaf })]
+        [String]
+        $FilePath,
 
-if ($LastExitCode -ne 0) {
-    Write-Host
-    Write-Warning "The package '$PackageName' was not retrieved. Please examine the above logs to fix a problem to get the latest package version."
-    Write-Host
+        [Parameter()]
+        [String]
+        $ColumnName = 'msprov_payload'
+    )
+
+    try {
+        $fileInfo = Get-Item -Path $FilePath
+        $fileSizeMB = [Math]::Round($fileInfo.Length / 1MB, 2)
+
+        Write-Host "Uploading CSU extension package file: $($fileInfo.Name) ($fileSizeMB MB)"
+
+        Set-FileColumnInChunks -setName 'msprov_commerceextensionassets' `
+            -id $PackageId `
+            -columnName $ColumnName `
+            -file $fileInfo
+
+        Write-Host "Successfully uploaded CSU extension package file to record: $PackageId`n" -ForegroundColor Green
+    }
+    catch {
+        Write-Error "Failed to upload CSU extension package file: $($_.Exception.Message)`n"
+        throw
+    }
 }
 
-# Delete the temporary project
-if (Test-Path $tempProjectFileName -ErrorAction SilentlyContinue)
-{
-    Remove-Item -Force $tempProjectFileName
+function Get-CsuExtensionPackage {
+    param (
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $PackageName,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $PackageVersion
+    )
+
+    try {
+        Write-Host "Querying CSU extension package: $PackageName ($PackageVersion)"
+
+        $escapedPackageName = $PackageName.Replace("'", "''")
+        $escapedPackageVersion = $PackageVersion.Replace("'", "''")
+        $filter = "?`$filter=msprov_name eq '$escapedPackageName' and msprov_version eq '$escapedPackageVersion' and msprov_assettype eq 0"
+        $response = Get-Records -setName 'msprov_commerceextensionassets' -query $filter
+
+        $records = $response.value
+
+        if (-not $records -or $records.Count -eq 0) {
+            Write-Host "No CSU extension package found: $PackageName ($PackageVersion)" -ForegroundColor Yellow
+            return $null
+        }
+
+        Write-Host "Found $($records.Count) CSU extension package record(s): $PackageName ($PackageVersion)`n" -ForegroundColor Green
+        return $records
+    }
+    catch {
+        Write-Error "Failed to query CSU extension package $PackageName ($PackageVersion): $($_.Exception.Message)`n"
+        throw
+    }
 }
 
-# Delete the temporary project's intermediate output folder (it is created during the package restore).
-$tempProjectObjDirName = Join-Path (Join-Path "Download" "ChannelData") "obj"
-if (Test-Path $tempProjectObjDirName -ErrorAction SilentlyContinue)
-{
-    Get-ChildItem $tempProjectObjDirName -Recurse | Remove-Item
-    Remove-Item -Force $tempProjectObjDirName
+function Get-CsuExtensionPackageFile {
+    param (
+        [Parameter(Mandatory)]
+        [System.Guid]
+        $PackageId,
+
+        [Parameter(Mandatory)]
+        [ValidateScript({ Test-Path $_ -PathType Container })]
+        [String]
+        $OutputDirectory,
+
+        [Parameter()]
+        [String]
+        $ColumnName = 'msprov_payload'
+    )
+
+    try {
+        Write-Host "Downloading CSU extension package file from record: $PackageId"
+
+        $file = Get-FileColumnInChunks -setName 'msprov_commerceextensionassets' `
+            -id $PackageId `
+            -columnName $ColumnName `
+            -outputDirectory $OutputDirectory
+
+        Write-Host "Successfully downloaded CSU extension package file: $($file.Name)`n" -ForegroundColor Green
+        return $file
+    }
+    catch {
+        Write-Error "Failed to download CSU extension package file: $($_.Exception.Message)`n"
+        throw
+    }
 }
 
 # SIG # Begin signature block
 # MIIoKgYJKoZIhvcNAQcCoIIoGzCCKBcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCC0XbcG1ejNKp/5
-# dNWeR0Yvf2lcQgtrjww6ku10jqjvh6CCDXYwggX0MIID3KADAgECAhMzAAAEhV6Z
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCkH0lDp4vhyVxg
+# HqQpKbs8RRWIikHX+xG/HV6lxe2g+KCCDXYwggX0MIID3KADAgECAhMzAAAEhV6Z
 # 7A5ZL83XAAAAAASFMA0GCSqGSIb3DQEBCwUAMH4xCzAJBgNVBAYTAlVTMRMwEQYD
 # VQQIEwpXYXNoaW5ndG9uMRAwDgYDVQQHEwdSZWRtb25kMR4wHAYDVQQKExVNaWNy
 # b3NvZnQgQ29ycG9yYXRpb24xKDAmBgNVBAMTH01pY3Jvc29mdCBDb2RlIFNpZ25p
@@ -132,19 +253,19 @@ if (Test-Path $tempProjectObjDirName -ErrorAction SilentlyContinue)
 # aWNyb3NvZnQgQ29ycG9yYXRpb24xKDAmBgNVBAMTH01pY3Jvc29mdCBDb2RlIFNp
 # Z25pbmcgUENBIDIwMTECEzMAAASFXpnsDlkvzdcAAAAABIUwDQYJYIZIAWUDBAIB
 # BQCgga4wGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEO
-# MAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIPjgiQ5wlaaFlBLUJeqx3zs0
-# Cb2EEsRN+q5zEj5DlIAZMEIGCisGAQQBgjcCAQwxNDAyoBSAEgBNAGkAYwByAG8A
+# MAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIEmTHlnvA3iWfg047E+x1uVZ
+# orkKLLnmEix29tMQH/fnMEIGCisGAQQBgjcCAQwxNDAyoBSAEgBNAGkAYwByAG8A
 # cwBvAGYAdKEagBhodHRwOi8vd3d3Lm1pY3Jvc29mdC5jb20wDQYJKoZIhvcNAQEB
-# BQAEggEAgG0mV6JjqxJs4QHjuHch+xuWco5gI248YOGfVNFTK5l99Sq5y2TmVPZI
-# 3n2yMCu7J3W1HFq3+vVkHDSCHQdXW6APoFwTtzvx6QDrqGbHmrk5rYZfK3uCPNTm
-# 8HFbQKboAwsCnqUaLGse6DSn7jeaWVf0dd1G4W4D53lSVeKiRKxQVIymajhO0tUP
-# eP2pT+BoRCTvzv7idDCngFu01STIq3tEgfS0DdwSs5VN+J5U+PjnMuwHdhu43Mww
-# vsgZ7yFaJWZpgkh8MpinqBVSE7vctMfO5VysxMAGVREKHtHcTHyzV57SDyQUAG7+
-# dWGFehHPW5jd4+WYJ78D7Y0vxQ2X2qGCF5QwgheQBgorBgEEAYI3AwMBMYIXgDCC
+# BQAEggEAUPfyGsvzTqehed0NS4DpAKzho9YocNeoNTyrh+Gjk+Gwzij9tdVHc+jV
+# vbQbfFGzJYWuhfM+uFkoldN+QauBxoHVqobl72NjGxm8vIdtaXM/icUVgFjzFy20
+# k6xPPFPY3EgBTMlMSV1z8a0SHqhccFZswuv4AXB9gcDhnenSwoi/sKG9Tb8S5YhF
+# n2dLeIvD+6PeKYCdXzAU8lslBspQad/d0h5yWhe2WmS97IsCBbUVf2jX9qaO4uEe
+# El1IhX/AcrcPUMPG2+Ti7DCthLWpDFq0FrxUb4oCuKgLyu6P+wyxdmNbBwdEsLE3
+# Ib2/KRQxRaM6vSAmIClLPh493I3UAaGCF5QwgheQBgorBgEEAYI3AwMBMYIXgDCC
 # F3wGCSqGSIb3DQEHAqCCF20wghdpAgEDMQ8wDQYJYIZIAWUDBAIBBQAwggFSBgsq
 # hkiG9w0BCRABBKCCAUEEggE9MIIBOQIBAQYKKwYBBAGEWQoDATAxMA0GCWCGSAFl
-# AwQCAQUABCAQ8bo4EWSobxYEO0dBx2TPA1DKU+RurJgav0BlJ1xu0QIGadgYb8xI
-# GBMyMDI2MDQxMDEwMTEzOS43NzZaMASAAgH0oIHRpIHOMIHLMQswCQYDVQQGEwJV
+# AwQCAQUABCAylyb/1EE7wmi2GxZcvP6Uw6cPBJsriis18/ZztzBt0QIGadgYb8yA
+# GBMyMDI2MDQxMDEwMTE0MS4xNzlaMASAAgH0oIHRpIHOMIHLMQswCQYDVQQGEwJV
 # UzETMBEGA1UECBMKV2FzaGluZ3RvbjEQMA4GA1UEBxMHUmVkbW9uZDEeMBwGA1UE
 # ChMVTWljcm9zb2Z0IENvcnBvcmF0aW9uMSUwIwYDVQQLExxNaWNyb3NvZnQgQW1l
 # cmljYSBPcGVyYXRpb25zMScwJQYDVQQLEx5uU2hpZWxkIFRTUyBFU046N0YwMC0w
@@ -249,22 +370,22 @@ if (Test-Path $tempProjectObjDirName -ErrorAction SilentlyContinue)
 # ZDEeMBwGA1UEChMVTWljcm9zb2Z0IENvcnBvcmF0aW9uMSYwJAYDVQQDEx1NaWNy
 # b3NvZnQgVGltZS1TdGFtcCBQQ0EgMjAxMAITMwAAAh6jrKRuOW98SQABAAACHjAN
 # BglghkgBZQMEAgEFAKCCAUowGgYJKoZIhvcNAQkDMQ0GCyqGSIb3DQEJEAEEMC8G
-# CSqGSIb3DQEJBDEiBCB2Elf2Ei34TqwxnyKG2ftm+TCc3ebKhOCxihKynHGXBjCB
+# CSqGSIb3DQEJBDEiBCBxa9ZIgQJMTWpBqXT16P62j4HqPMHE4TZx4+EOQJ2ynjCB
 # +gYLKoZIhvcNAQkQAi8xgeowgecwgeQwgb0EIC+BXWrz9geMgM8Bvn8bqxHjhHXJ
 # 29EBizITIw0B9vOCMIGYMIGApH4wfDELMAkGA1UEBhMCVVMxEzARBgNVBAgTCldh
 # c2hpbmd0b24xEDAOBgNVBAcTB1JlZG1vbmQxHjAcBgNVBAoTFU1pY3Jvc29mdCBD
 # b3Jwb3JhdGlvbjEmMCQGA1UEAxMdTWljcm9zb2Z0IFRpbWUtU3RhbXAgUENBIDIw
 # MTACEzMAAAIeo6ykbjlvfEkAAQAAAh4wIgQgi0kynQmklMHno5Hl9J4Bblsg4pwT
-# 2q/XDKrPmdCQSk0wDQYJKoZIhvcNAQELBQAEggIApahsTz3x16WHhmOBQHjuaiq7
-# CuR9axKplIeoIgLpbsps9MFWJc/sqYkyyi7D62nsSeha9kDrknpQUGQChskDVrys
-# 2cGqnGHs/jLlbddqg9bcgHJhl0noZNIz0HAm8ZCMSa+8Td1hwDIYqDXDd7NDTtky
-# 1Qomfg6mblMBUpAEtuHZd23dJlhw5PQYg6OtchJdw/98gvUh/p6VTEy1mRP33ie8
-# faew15aDzrL6dKkj6J4rUW/wKESmg0lSa2sk56iKyNVm96sKaZ4/1SXWqF8UbqPo
-# 2LR6vYxsbyHr8tBjKpuXhzYgtfKIaNT/k9GdRlNA+LPO4dSG2mnm+P//q0SN6tQz
-# MSmMRoiZN7BPhNEdoOo2PmfRGXcmJkRjZFhQ7l+iBobEa6OOm9a+ECUvKnjv6WZ8
-# vVyuoKo2VbQQWveWQ6gA4x7+pCsL2SeaHywWVTzblsno0XRAXZF/J9veP3U4geaS
-# eRZb4aRKBk1iKUxUY5u45yAWgEzPOz2EEosMsDH11/buj1f7RW8FYfwypZe+tkYe
-# sRdJhcyVeQ1LBLmeszLpwP9ZkcPFoi0CRGqwHPvi1vNi9ZL0lZP7ElxJXdJEh2YY
-# bLYsoq8RgzzgV3NHNWv8HMoCKtzz2iUFzryWVLfbmEz/ykQKENSTKgcYxK7aDRZr
-# 9H+7o+7ifjiazHcouOg=
+# 2q/XDKrPmdCQSk0wDQYJKoZIhvcNAQELBQAEggIAHfkYG3qG0hqF7ihBDBwIke2v
+# iBSrnVqVJEmdX/DtUGNO+3DAQDN/E5w8ngfxTNrNEKjgdhJMjKxX8iOQ/wor9soe
+# ZoPJ08f8a85QIB9XscjfcOt3al8nu2/J0gcuLvifkokRShC+Ai4lI0W9Or61RKTR
+# nViLJ7gl9nJ/7pHca4t0kiSm7og6gA6q9Dh6M72YlW5hWlQtLAkIx8UKp7O5hNqB
+# AQc+tRWb1PoQz1mBzvh18EWUn9kySuX4Nx9oxWMdr5eipGfgMl64SfUivdM3qcDG
+# A25M+1De7fMK+dvKC9BLOCk4nKNstR43JtMcHb1iWcVtrE1sh0wVzW3gVbZM1NTK
+# hn2vfIB5jvcZLp/uE/m3K7SbKJXyNfKD2KhiGqAlnJs3f5V42TlwNUNfSTwRHbHj
+# IB4G19E7sJ0lcgd3modZV/y3JHjW5AMP3WnC+l3AUGbpG2vIgXRfM/kYaTrhHC6l
+# Zimr7R7QB/e5ejhQrDH42xkXEpuPdcnr2+dg4mDFbjJ6S2qSnNKgc5w56vbu0Q76
+# +Z8jyMYltBG79qeEOpluElcKQBD9jgPWKgK23P9j+okpQ2/X/V46hDgfFsys8Afc
+# u5CSJFSm7fQ2Gjw9Zv3r9fTCr6I4qrkZ0Epx8+7AvaCq2sryfj6At4Guff+1W0Zb
+# XipLihW25ek/xAJzPgE=
 # SIG # End signature block

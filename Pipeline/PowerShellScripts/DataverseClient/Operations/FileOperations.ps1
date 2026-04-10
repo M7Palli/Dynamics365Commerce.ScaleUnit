@@ -1,61 +1,181 @@
-<#
-.SYNOPSIS
-Restore the nuget package to the specified folder.
+function Set-FileColumnInChunks {
+    param (
+        [Parameter(Mandatory)]
+        [string]
+        $setName,
 
-.PARAMETER PackageName
-The name of package do download.
+        [Parameter(Mandatory)]
+        [System.Guid]
+        $id,
 
-.PARAMETER PackageRootFolder
-The download root folder.
-#>
-[CmdletBinding()]
-param(
-    [string]
-    $PackageName,
+        [Parameter(Mandatory)]
+        [string]
+        $columnName,
 
-    [string]
-    $PackageRootFolder
-)
-Import-Module (Join-Path $PSScriptRoot "ErrorDecorator.psm1")
+        [Parameter(Mandatory, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [System.IO.FileInfo]
+        $file
+    )
 
-$tempProjectFileName = Join-Path $PackageRootFolder "Temporary.csproj"
-if (Test-Path $tempProjectFileName -ErrorAction SilentlyContinue)
-{
-    Remove-Item -Force $tempProjectFileName
+    $uri = '{0}{1}({2})' -f $baseURI, $setName, $id
+    $uri += '/{0}?x-ms-file-name={1}' -f $columnName, $file.Name
+
+    $chunkHeaders = $baseHeaders.Clone()
+    $chunkHeaders['x-ms-transfer-mode'] = 'chunked'
+
+    $InitializeChunkedFileUploadRequest = @{
+        Uri     = $uri
+        Method  = 'Patch'
+        Headers = $chunkHeaders
+    }
+
+    Invoke-RestMethod @InitializeChunkedFileUploadRequest -ResponseHeadersVariable rhv | Out-Null
+
+    $locationUri = $rhv['Location'][0]
+    $chunkSize = [int]$rhv['x-ms-chunk-size'][0]
+
+    Write-Host "Chunk size: $([Math]::Round($chunkSize / 1MB, 2)) MB"
+
+    $stream = [System.IO.File]::OpenRead($file.FullName)
+    try {
+        $fileSize = $stream.Length
+        $totalChunks = [Math]::Ceiling($fileSize / $chunkSize)
+        $currentChunk = 0
+
+        for ($offset = 0; $offset -lt $fileSize; $offset += $chunkSize) {
+
+            $currentChunk++
+
+            $count = if (($offset + $chunkSize) -gt $fileSize) {
+                $fileSize - $offset
+            }
+            else {
+                $chunkSize
+            }
+
+            $buffer = [byte[]]::new($count)
+            [void]$stream.Read($buffer, 0, $count)
+
+            $lastByte = $offset + ($count - 1)
+
+            $range = 'bytes {0}-{1}/{2}' -f $offset, $lastByte, $fileSize
+
+            $contentHeaders = $baseHeaders.Clone()
+            $contentHeaders['Content-Range'] = $range
+            $contentHeaders['Content-Type'] = 'application/octet-stream'
+            $contentHeaders['x-ms-file-name'] = $file.Name
+
+            $UploadFileChunkRequest = @{
+                Uri     = $locationUri
+                Method  = 'Patch'
+                Headers = $contentHeaders
+                Body    = $buffer
+            }
+
+            Invoke-RestMethod @UploadFileChunkRequest | Out-Null
+
+            Write-Host "Uploaded chunk $currentChunk/$totalChunks"
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
 }
 
-# Since the "dotnet add package" command does not operate on the package level (only at project or solution level),
-# create a temporary project and add a package to it specifying the $PackageRootFolder folder to store the package.
-$tempProjectContent = "<Project Sdk='Microsoft.NET.Sdk'><PropertyGroup><TargetFramework>netstandard2.0</TargetFramework></PropertyGroup></Project>"
-$tempProjectContent | Out-File $tempProjectFileName
+function Get-FileColumnInChunks {
+    param (
+        [Parameter(Mandatory)]
+        [string]
+        $setName,
 
-& dotnet add $tempProjectFileName package $PackageName --package-directory $PackageRootFolder --prerelease --interactive
+        [Parameter(Mandatory)]
+        [System.Guid]
+        $id,
 
-if ($LastExitCode -ne 0) {
-    Write-Host
-    Write-Warning "The package '$PackageName' was not retrieved. Please examine the above logs to fix a problem to get the latest package version."
-    Write-Host
+        [Parameter(Mandatory)]
+        [string]
+        $columnName,
+
+        [Parameter(Mandatory)]
+        [ValidateScript({ Test-Path $_ -PathType Container })]
+        [string]
+        $outputDirectory
+    )
+
+    $uri = '{0}{1}({2})/{3}/$value' -f $baseURI, $setName, $id, $columnName
+
+    $chunkSize = 4 * 1024 * 1024  # 4 MB
+
+    # Use minimal headers for file download (OData headers cause 400 on file endpoints)
+    $downloadHeaders = @{
+        'Authorization' = $baseHeaders['Authorization']
+        'Range'         = 'bytes=0-{0}' -f ($chunkSize - 1)
+    }
+
+    $InitialDownloadRequest = @{
+        Uri     = $uri
+        Method  = 'Get'
+        Headers = $downloadHeaders
+    }
+
+    $response = Invoke-WebRequest @InitialDownloadRequest
+
+    $fileName = $response.Headers['x-ms-file-name'][0]
+    $fileSize = [long]$response.Headers['x-ms-file-size'][0]
+
+    Write-Host "Downloading file: $fileName ($([Math]::Round($fileSize / 1MB, 2)) MB)"
+    Write-Host "Chunk size: $([Math]::Round($chunkSize / 1MB, 2)) MB"
+
+    $totalChunks = [Math]::Ceiling($fileSize / $chunkSize)
+    $currentChunk = 1
+
+    $outputFilePath = Join-Path $outputDirectory $fileName
+    $stream = [System.IO.File]::Create($outputFilePath)
+    try {
+        $stream.Write([byte[]]$response.Content, 0, $response.Content.Length)
+
+        Write-Host "Downloaded chunk $currentChunk/$totalChunks"
+
+        $offset = $response.Content.Length
+
+        while ($offset -lt $fileSize) {
+
+            $currentChunk++
+
+            $lastByte = [Math]::Min($offset + $chunkSize - 1, $fileSize - 1)
+
+            $chunkHeaders = @{
+                'Authorization' = $baseHeaders['Authorization']
+                'Range'         = 'bytes={0}-{1}' -f $offset, $lastByte
+            }
+
+            $DownloadChunkRequest = @{
+                Uri     = $uri
+                Method  = 'Get'
+                Headers = $chunkHeaders
+            }
+
+            $response = Invoke-WebRequest @DownloadChunkRequest
+
+            $stream.Write([byte[]]$response.Content, 0, $response.Content.Length)
+            $offset += $response.Content.Length
+
+            Write-Host "Downloaded chunk $currentChunk/$totalChunks"
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+
+    Write-Host "File saved to: $outputFilePath"
+
+    return Get-Item $outputFilePath
 }
-
-# Delete the temporary project
-if (Test-Path $tempProjectFileName -ErrorAction SilentlyContinue)
-{
-    Remove-Item -Force $tempProjectFileName
-}
-
-# Delete the temporary project's intermediate output folder (it is created during the package restore).
-$tempProjectObjDirName = Join-Path (Join-Path "Download" "ChannelData") "obj"
-if (Test-Path $tempProjectObjDirName -ErrorAction SilentlyContinue)
-{
-    Get-ChildItem $tempProjectObjDirName -Recurse | Remove-Item
-    Remove-Item -Force $tempProjectObjDirName
-}
-
 # SIG # Begin signature block
 # MIIoKgYJKoZIhvcNAQcCoIIoGzCCKBcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCC0XbcG1ejNKp/5
-# dNWeR0Yvf2lcQgtrjww6ku10jqjvh6CCDXYwggX0MIID3KADAgECAhMzAAAEhV6Z
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAQDa6F4VMCcWb2
+# AhXP1c9qxGuHhH5vkZGE4gNDg73fLKCCDXYwggX0MIID3KADAgECAhMzAAAEhV6Z
 # 7A5ZL83XAAAAAASFMA0GCSqGSIb3DQEBCwUAMH4xCzAJBgNVBAYTAlVTMRMwEQYD
 # VQQIEwpXYXNoaW5ndG9uMRAwDgYDVQQHEwdSZWRtb25kMR4wHAYDVQQKExVNaWNy
 # b3NvZnQgQ29ycG9yYXRpb24xKDAmBgNVBAMTH01pY3Jvc29mdCBDb2RlIFNpZ25p
@@ -132,62 +252,62 @@ if (Test-Path $tempProjectObjDirName -ErrorAction SilentlyContinue)
 # aWNyb3NvZnQgQ29ycG9yYXRpb24xKDAmBgNVBAMTH01pY3Jvc29mdCBDb2RlIFNp
 # Z25pbmcgUENBIDIwMTECEzMAAASFXpnsDlkvzdcAAAAABIUwDQYJYIZIAWUDBAIB
 # BQCgga4wGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEO
-# MAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIPjgiQ5wlaaFlBLUJeqx3zs0
-# Cb2EEsRN+q5zEj5DlIAZMEIGCisGAQQBgjcCAQwxNDAyoBSAEgBNAGkAYwByAG8A
+# MAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIJGs/15GS/0Ua8XWZwZCLfmX
+# 6UreSNDL1hJQYSdEbPvzMEIGCisGAQQBgjcCAQwxNDAyoBSAEgBNAGkAYwByAG8A
 # cwBvAGYAdKEagBhodHRwOi8vd3d3Lm1pY3Jvc29mdC5jb20wDQYJKoZIhvcNAQEB
-# BQAEggEAgG0mV6JjqxJs4QHjuHch+xuWco5gI248YOGfVNFTK5l99Sq5y2TmVPZI
-# 3n2yMCu7J3W1HFq3+vVkHDSCHQdXW6APoFwTtzvx6QDrqGbHmrk5rYZfK3uCPNTm
-# 8HFbQKboAwsCnqUaLGse6DSn7jeaWVf0dd1G4W4D53lSVeKiRKxQVIymajhO0tUP
-# eP2pT+BoRCTvzv7idDCngFu01STIq3tEgfS0DdwSs5VN+J5U+PjnMuwHdhu43Mww
-# vsgZ7yFaJWZpgkh8MpinqBVSE7vctMfO5VysxMAGVREKHtHcTHyzV57SDyQUAG7+
-# dWGFehHPW5jd4+WYJ78D7Y0vxQ2X2qGCF5QwgheQBgorBgEEAYI3AwMBMYIXgDCC
+# BQAEggEAD52OnYZYlZGzXnEaHGwN1yilFKVCmi8nj9RV5wYzgHHP8yn/qPAOFaz6
+# Yfznr9R1yY9FZGy7NqF6xMqXynCssm/SASVX/IYSHGphLQzybFLlJG0qVMK2smCF
+# pYZK+lKfo84YQJf+zGCE967ZJf+fW0W359ZF2HGFlFq2uZXyGF/7PqYouMmC0L5N
+# F2Nv4fGwGQ+Kk4I7DaPrxIJsOF1+8Iqp9jQQO8y2ru7HIfsDL7SIcSXuhrqlkfJ2
+# iyWKUQ8Uwy+gVIabITW2KByeDvVF8DmnAqm/ycTj6x0umxfaYQwcBfNk8ZZh8RKW
+# uAmSNs3nqx/GuQ0CvfnEGvvnn0+9+6GCF5QwgheQBgorBgEEAYI3AwMBMYIXgDCC
 # F3wGCSqGSIb3DQEHAqCCF20wghdpAgEDMQ8wDQYJYIZIAWUDBAIBBQAwggFSBgsq
 # hkiG9w0BCRABBKCCAUEEggE9MIIBOQIBAQYKKwYBBAGEWQoDATAxMA0GCWCGSAFl
-# AwQCAQUABCAQ8bo4EWSobxYEO0dBx2TPA1DKU+RurJgav0BlJ1xu0QIGadgYb8xI
-# GBMyMDI2MDQxMDEwMTEzOS43NzZaMASAAgH0oIHRpIHOMIHLMQswCQYDVQQGEwJV
+# AwQCAQUABCAG9uHkBhRX2IBFql40jtzSQPLaphmll0FcGeljpMsY+QIGadfQxz99
+# GBMyMDI2MDQxMDEwMTEzOS45MThaMASAAgH0oIHRpIHOMIHLMQswCQYDVQQGEwJV
 # UzETMBEGA1UECBMKV2FzaGluZ3RvbjEQMA4GA1UEBxMHUmVkbW9uZDEeMBwGA1UE
 # ChMVTWljcm9zb2Z0IENvcnBvcmF0aW9uMSUwIwYDVQQLExxNaWNyb3NvZnQgQW1l
-# cmljYSBPcGVyYXRpb25zMScwJQYDVQQLEx5uU2hpZWxkIFRTUyBFU046N0YwMC0w
+# cmljYSBPcGVyYXRpb25zMScwJQYDVQQLEx5uU2hpZWxkIFRTUyBFU046QTAwMC0w
 # NUUwLUQ5NDcxJTAjBgNVBAMTHE1pY3Jvc29mdCBUaW1lLVN0YW1wIFNlcnZpY2Wg
-# ghHqMIIHIDCCBQigAwIBAgITMwAAAh6jrKRuOW98SQABAAACHjANBgkqhkiG9w0B
+# ghHqMIIHIDCCBQigAwIBAgITMwAAAiu7AFD/TTuaoQABAAACKzANBgkqhkiG9w0B
 # AQsFADB8MQswCQYDVQQGEwJVUzETMBEGA1UECBMKV2FzaGluZ3RvbjEQMA4GA1UE
 # BxMHUmVkbW9uZDEeMBwGA1UEChMVTWljcm9zb2Z0IENvcnBvcmF0aW9uMSYwJAYD
-# VQQDEx1NaWNyb3NvZnQgVGltZS1TdGFtcCBQQ0EgMjAxMDAeFw0yNjAyMTkxOTM5
-# NDlaFw0yNzA1MTcxOTM5NDlaMIHLMQswCQYDVQQGEwJVUzETMBEGA1UECBMKV2Fz
+# VQQDEx1NaWNyb3NvZnQgVGltZS1TdGFtcCBQQ0EgMjAxMDAeFw0yNjAyMTkxOTQw
+# MTFaFw0yNzA1MTcxOTQwMTFaMIHLMQswCQYDVQQGEwJVUzETMBEGA1UECBMKV2Fz
 # aGluZ3RvbjEQMA4GA1UEBxMHUmVkbW9uZDEeMBwGA1UEChMVTWljcm9zb2Z0IENv
 # cnBvcmF0aW9uMSUwIwYDVQQLExxNaWNyb3NvZnQgQW1lcmljYSBPcGVyYXRpb25z
-# MScwJQYDVQQLEx5uU2hpZWxkIFRTUyBFU046N0YwMC0wNUUwLUQ5NDcxJTAjBgNV
+# MScwJQYDVQQLEx5uU2hpZWxkIFRTUyBFU046QTAwMC0wNUUwLUQ5NDcxJTAjBgNV
 # BAMTHE1pY3Jvc29mdCBUaW1lLVN0YW1wIFNlcnZpY2UwggIiMA0GCSqGSIb3DQEB
-# AQUAA4ICDwAwggIKAoICAQCl0TjtbDwsR7Fe8ac6ol5s1zhtTqd2AWpchQhLp9G5
-# mmSM23N5fyQGCQ1D06rOA3PgXKF+76vXvOCs2VsLv1owj4mHEyEqiq8GJ5yC+/QN
-# YRpZPA8e7OgekzDO6S/4vy/jTMYbp3rhuFiKKCzTWOQtdFcF+D0k369I7pm/E07S
-# yNMGkuNd5lj5SJ91UqFuZfjMB6cQ2wh77mtiRUVdj53yjdNqj+GQl+Yaz29Bjrzn
-# 7U1ln+JpLlnb0xdGmZoIPKZbwBVcWtyL4uyhML7SSTmiOfWXU+g+yNl0CdoLGL8L
-# tWHEi8FsuTPeSdSqmeMrvLaEmibTVTS4vQQY8NPnb6uI5y6iNV9vBFcm8LU/lDTj
-# GTqPa7UBT4gdf5Jm3wYrfCFZ4P/j5MoqT0JONca50jt4TGI90SihXaDEYqk23S0I
-# JZ3UkUpukDRTjK713BIykffxyBqMeQqfO0zvWfUx7BrmUpugQcw99+DxLl2gf+uQ
-# EpRmnlbrVJ9dvW9ds4fqEPN2jG0QwF1PBSglNcV1SpqZKitQgBGSwu/82AKztoCH
-# wYRHRNwzwTVe/1KNTvmqAd4Uges4ywOH02haagT8wYY8OdWdjKn3k052w+kmc0UC
-# 0F+iVXTGZIMxvo9iBZQoXehzRtWJ/VOtKvCyS3csKzN7rStWJwjSWz6dtOf0l+yt
-# LQIDAQABo4IBSTCCAUUwHQYDVR0OBBYEFOYKFprqBB0JZmJcFC4cPPmeF4JkMB8G
+# AQUAA4ICDwAwggIKAoICAQCX3mi6OD3syUqQm4QqgkrKPbcsK/Qx3fYctL8+VM1u
+# OY3booi5GxwauTgQf6JFHITToxS7gjqKlK8OFLzL6UTl0jxEK5t6DuOcgJXdvuti
+# moTlOS0C3kyITXBAXoj/gp6hRR9z6WRip1Ktkilb3dJXCjQqT9P2Cuujr+Vz8r+Z
+# +jDl09ji/ic/4G34r3mVwjs//Gnx9Pu31V8rXFicNiAzxpubawpbd8pqfzlWT2vn
+# G3kF9l6MiREbvJ3XHLUwHQsh0t/TrSFx/s/yCqpJWYJ6oClG70tvsFH0aRP8wB4c
+# P/CFa2ILvk26i3OcJBl+pqKjHTSBy9mvwTPEDlnzco0Nt8R6pSPTXZgBsscHhoKf
+# C0WQmOzY2keXbAmRTcZMyXz5v/AJbmoI0y07Bazvt5NkXddG9TErQWwtsFyIKrEl
+# DgWfHeCoTu1wu2ciD3dK72z3ca2gzoEDxT2j9BXIUKaiTzTdQPRsAMaO3dU0zaGw
+# MMlwtSJyDh14YEgZoUu5vS8MugMqdrNjphyL65yKhjpAWbhYkIHO/0uZju95tP8z
+# ZNqXIRh4tdfWHJPATn9r+cxkyuh2x0VLdfx1lmK9X3NjH0NtgAs5JB/wOlkyuudx
+# mFTfWVyRrL37ispOZ8aPAFgvyR6cNTkGpkFo35JRjciNmZiU4qT9Uty+V5gudFk1
+# jwIDAQABo4IBSTCCAUUwHQYDVR0OBBYEFD4WjuQTUJbtbd3jmvZku0FZ2eU2MB8G
 # A1UdIwQYMBaAFJ+nFV0AXmJdg/Tl0mWnG1M1GelyMF8GA1UdHwRYMFYwVKBSoFCG
 # Tmh0dHA6Ly93d3cubWljcm9zb2Z0LmNvbS9wa2lvcHMvY3JsL01pY3Jvc29mdCUy
 # MFRpbWUtU3RhbXAlMjBQQ0ElMjAyMDEwKDEpLmNybDBsBggrBgEFBQcBAQRgMF4w
 # XAYIKwYBBQUHMAKGUGh0dHA6Ly93d3cubWljcm9zb2Z0LmNvbS9wa2lvcHMvY2Vy
 # dHMvTWljcm9zb2Z0JTIwVGltZS1TdGFtcCUyMFBDQSUyMDIwMTAoMSkuY3J0MAwG
 # A1UdEwEB/wQCMAAwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwgwDgYDVR0PAQH/BAQD
-# AgeAMA0GCSqGSIb3DQEBCwUAA4ICAQCkoZB5NnJVFb5wKejRonk518a2TBNYpKcB
-# MtfL6BS0ARaABOMGYLlPNuhI1HwmelP9hX3oq3TaEm/cDkkzNQAzDedPgoRI2R7+
-# 8poNSWvHXEAs7SZODm9x7KqlBkNZM9ex4XY1yNmVOAmWDjRr7jKjaiQbntf7EC4G
-# NikxGGaVWOjfYt3Q9X0r/Ks8KBlbzDR9zjA/TCctR4co1WpU1ZRLFrB9bl8dRxsb
-# nyT2qQ41E7dT12R30eIGUziEs5GN+26V/ovXOi20dJiM13hYWvy1NNJAhkKOlLB1
-# ONund6ffhPdUcHWsu8V+lR0aakMV64HqDbLumZrCNwUofVx3xMk8F4tCYJtQxLTy
-# wc30sZAD1S2sC1959x6KixA+p41FLUl8g64oHy3bfYnH5xd4JOBgQoaqndGjcctx
-# r+8EknjhKyrgAzrTcKLJbUezgoye8brCLJ+y6PAoEjpXRkSYAU8wfQ3YWRck6ALw
-# oV7Uin8+rpGQSbXhF6c1dTFakXmChClud4IADY/t6JRkJ+06FzL+jDd8KLV8Qj77
-# JfiuTiPIG5G/xlnGoZFcX+yyBtDvzZE48d+Y+HYUd/cvhH1FKl7AH+5AyotqJSFm
-# vM/BuYRx2B20asVXilV2k2JbNO3LGCz3Q+dpElzwsfJrka1N/getma7fWpowsNvo
-# IaEQvjad8TCCB3EwggVZoAMCAQICEzMAAAAVxedrngKbSZkAAAAAABUwDQYJKoZI
+# AgeAMA0GCSqGSIb3DQEBCwUAA4ICAQDO/CKsciEM8kr1fqH4TlfT66ENoTjxXw81
+# 0pyEq0PdrgLwfgT3x+1gz7CQHtUdevqMQ5qHyDLhm6pT911CYkGN+6g+MU7fMYTr
+# 6d3SxieJwBIoWkfR4g7SitGzMKU465KEYejfddoUgovC/xcRpaALO5p3/A248Byh
+# JiMttBQNDtsT/HaCFwRFCURby/f8c1kky8F8xkCXFz+/MtZ5d1lWFjwOI2geZHWq
+# 9XihDOgee5nS2koo5V6n8XG220UTevVf+pgmpIH71XKDVIYTGGZJs6yPlfJ2aXqw
+# 1ME4NR6okNsY3P1M31H6DMYRfJGNBNep595kXGh3YzA3cCiyg+jmJ58h/fTvjngI
+# puUFfODpDjFx0ic1YoLANxhCF3RhS9qYM7K40NEhKshYuaAkIG2XBKYig3r/0/b0
+# sjvjBws55AYonMm3A8qcX/6k9Vfc0mv9dtonHuWGfA2b+qE2qpCnhzGbdDHq7iOS
+# ZEw01nNupAMf1c41k9IoTQ2z3iw6w4ZZoLOyg4TKMbp1krpT4trip/y30Cv5khyq
+# CDNqaXQpBkOYON8LgtoQ3amVOX7ix5jdrnx/vUxTUSigXvrWdL7Uk8kpmS0zto2T
+# oy7aT5oBzCTvfj9iJ/BN/E1vhFBkhJCvZ7PVvsMSnTTmkx2Fal2lVkztuAI44fD/
+# uyLJdaMQSzCCB3EwggVZoAMCAQICEzMAAAAVxedrngKbSZkAAAAAABUwDQYJKoZI
 # hvcNAQELBQAwgYgxCzAJBgNVBAYTAlVTMRMwEQYDVQQIEwpXYXNoaW5ndG9uMRAw
 # DgYDVQQHEwdSZWRtb25kMR4wHAYDVQQKExVNaWNyb3NvZnQgQ29ycG9yYXRpb24x
 # MjAwBgNVBAMTKU1pY3Jvc29mdCBSb290IENlcnRpZmljYXRlIEF1dGhvcml0eSAy
@@ -230,41 +350,41 @@ if (Test-Path $tempProjectObjDirName -ErrorAction SilentlyContinue)
 # MIICNQIBATCB+aGB0aSBzjCByzELMAkGA1UEBhMCVVMxEzARBgNVBAgTCldhc2hp
 # bmd0b24xEDAOBgNVBAcTB1JlZG1vbmQxHjAcBgNVBAoTFU1pY3Jvc29mdCBDb3Jw
 # b3JhdGlvbjElMCMGA1UECxMcTWljcm9zb2Z0IEFtZXJpY2EgT3BlcmF0aW9uczEn
-# MCUGA1UECxMeblNoaWVsZCBUU1MgRVNOOjdGMDAtMDVFMC1EOTQ3MSUwIwYDVQQD
-# ExxNaWNyb3NvZnQgVGltZS1TdGFtcCBTZXJ2aWNloiMKAQEwBwYFKw4DAhoDFQCD
-# /QNkKDIW4VIF7j3oi2qbrR0a/6CBgzCBgKR+MHwxCzAJBgNVBAYTAlVTMRMwEQYD
+# MCUGA1UECxMeblNoaWVsZCBUU1MgRVNOOkEwMDAtMDVFMC1EOTQ3MSUwIwYDVQQD
+# ExxNaWNyb3NvZnQgVGltZS1TdGFtcCBTZXJ2aWNloiMKAQEwBwYFKw4DAhoDFQAJ
+# rD90ykHpo/0AGb7lmwvsCtqROaCBgzCBgKR+MHwxCzAJBgNVBAYTAlVTMRMwEQYD
 # VQQIEwpXYXNoaW5ndG9uMRAwDgYDVQQHEwdSZWRtb25kMR4wHAYDVQQKExVNaWNy
 # b3NvZnQgQ29ycG9yYXRpb24xJjAkBgNVBAMTHU1pY3Jvc29mdCBUaW1lLVN0YW1w
-# IFBDQSAyMDEwMA0GCSqGSIb3DQEBCwUAAgUA7YM/nTAiGA8yMDI2MDQxMDA5MjEz
-# M1oYDzIwMjYwNDExMDkyMTMzWjB0MDoGCisGAQQBhFkKBAExLDAqMAoCBQDtgz+d
-# AgEAMAcCAQACAgcCMAcCAQACAhJaMAoCBQDthJEdAgEAMDYGCisGAQQBhFkKBAIx
+# IFBDQSAyMDEwMA0GCSqGSIb3DQEBCwUAAgUA7YL36jAiGA8yMDI2MDQxMDA0MTUz
+# OFoYDzIwMjYwNDExMDQxNTM4WjB0MDoGCisGAQQBhFkKBAExLDAqMAoCBQDtgvfq
+# AgEAMAcCAQACAgDVMAcCAQACAhJ3MAoCBQDthElqAgEAMDYGCisGAQQBhFkKBAIx
 # KDAmMAwGCisGAQQBhFkKAwKgCjAIAgEAAgMHoSChCjAIAgEAAgMBhqAwDQYJKoZI
-# hvcNAQELBQADggEBABFDOkrZAqswp+Wdi/5OSgFD+uHelZD4NpgoGrbg16Mu+eJp
-# KiebOJf7F1fnir2AnwGXhqzHQbrSjOeEii+3CHQ7gRwkM7+X9L54D2sJZQXPHUWp
-# defJ9RXTwtdDRu57ibK2cGK3GiKkXbiB+stI0iXvOjyns1/53EHgAO1tmMp0YJV6
-# hH9sMSjDYjoHlzFVTT0rzF81nDQQQfHuQLd3fFT72dhiW7vD7PNWASrlvc9mzKXQ
-# yZLu5ISGGS5dLv6yCl6bPMirGqbY3dZSwV2pWk+nLu2ArRk7MOQBJwWDv+0C8M8v
-# eFnznGCbTvJoZ5+mY4xzH5JnWGclbD1+OK/e3MQxggQNMIIECQIBATCBkzB8MQsw
+# hvcNAQELBQADggEBAHZ2RuoRW2yjqsCC5Ywbx59lRtwWywBii3jndvmSBGSeXfB4
+# 7r5e0HSdBPQZPceeN4cRu8E9pwbVGvjCuFnVroHFtJS2UtpVK0FG/n8Gj3CszO3/
+# PSaQu7BDxde9C60PydACsQG1E4hX7B2zIZr7Mh3+Jg2f59iMC+nNm3hpCPyVsQcB
+# wXvkc/g7xh/iAnSP/qjC6++gKoy0AWD3DC5EXnq51y7xztCMDsC35S5HUSdmQxP/
+# MG2wOy8ywagfXXnpdMevx3mN+oGu0/9SLx7dOhc1QTrGrPop9oqwoSTIIiApJSDs
+# F8fGCQHZWAfxlticrkl5GpqvweeWT+dtfIBlJsoxggQNMIIECQIBATCBkzB8MQsw
 # CQYDVQQGEwJVUzETMBEGA1UECBMKV2FzaGluZ3RvbjEQMA4GA1UEBxMHUmVkbW9u
 # ZDEeMBwGA1UEChMVTWljcm9zb2Z0IENvcnBvcmF0aW9uMSYwJAYDVQQDEx1NaWNy
-# b3NvZnQgVGltZS1TdGFtcCBQQ0EgMjAxMAITMwAAAh6jrKRuOW98SQABAAACHjAN
+# b3NvZnQgVGltZS1TdGFtcCBQQ0EgMjAxMAITMwAAAiu7AFD/TTuaoQABAAACKzAN
 # BglghkgBZQMEAgEFAKCCAUowGgYJKoZIhvcNAQkDMQ0GCyqGSIb3DQEJEAEEMC8G
-# CSqGSIb3DQEJBDEiBCB2Elf2Ei34TqwxnyKG2ftm+TCc3ebKhOCxihKynHGXBjCB
-# +gYLKoZIhvcNAQkQAi8xgeowgecwgeQwgb0EIC+BXWrz9geMgM8Bvn8bqxHjhHXJ
-# 29EBizITIw0B9vOCMIGYMIGApH4wfDELMAkGA1UEBhMCVVMxEzARBgNVBAgTCldh
+# CSqGSIb3DQEJBDEiBCBOywzJK9qnrygqVfAosdWBWtJWsfvPhcJSgYqBG4X5szCB
+# +gYLKoZIhvcNAQkQAi8xgeowgecwgeQwgb0EIHIOI/Q/kFftYA+M2OY+1Bx3ajBD
+# 6/WDAtPT2vFkv25SMIGYMIGApH4wfDELMAkGA1UEBhMCVVMxEzARBgNVBAgTCldh
 # c2hpbmd0b24xEDAOBgNVBAcTB1JlZG1vbmQxHjAcBgNVBAoTFU1pY3Jvc29mdCBD
 # b3Jwb3JhdGlvbjEmMCQGA1UEAxMdTWljcm9zb2Z0IFRpbWUtU3RhbXAgUENBIDIw
-# MTACEzMAAAIeo6ykbjlvfEkAAQAAAh4wIgQgi0kynQmklMHno5Hl9J4Bblsg4pwT
-# 2q/XDKrPmdCQSk0wDQYJKoZIhvcNAQELBQAEggIApahsTz3x16WHhmOBQHjuaiq7
-# CuR9axKplIeoIgLpbsps9MFWJc/sqYkyyi7D62nsSeha9kDrknpQUGQChskDVrys
-# 2cGqnGHs/jLlbddqg9bcgHJhl0noZNIz0HAm8ZCMSa+8Td1hwDIYqDXDd7NDTtky
-# 1Qomfg6mblMBUpAEtuHZd23dJlhw5PQYg6OtchJdw/98gvUh/p6VTEy1mRP33ie8
-# faew15aDzrL6dKkj6J4rUW/wKESmg0lSa2sk56iKyNVm96sKaZ4/1SXWqF8UbqPo
-# 2LR6vYxsbyHr8tBjKpuXhzYgtfKIaNT/k9GdRlNA+LPO4dSG2mnm+P//q0SN6tQz
-# MSmMRoiZN7BPhNEdoOo2PmfRGXcmJkRjZFhQ7l+iBobEa6OOm9a+ECUvKnjv6WZ8
-# vVyuoKo2VbQQWveWQ6gA4x7+pCsL2SeaHywWVTzblsno0XRAXZF/J9veP3U4geaS
-# eRZb4aRKBk1iKUxUY5u45yAWgEzPOz2EEosMsDH11/buj1f7RW8FYfwypZe+tkYe
-# sRdJhcyVeQ1LBLmeszLpwP9ZkcPFoi0CRGqwHPvi1vNi9ZL0lZP7ElxJXdJEh2YY
-# bLYsoq8RgzzgV3NHNWv8HMoCKtzz2iUFzryWVLfbmEz/ykQKENSTKgcYxK7aDRZr
-# 9H+7o+7ifjiazHcouOg=
+# MTACEzMAAAIruwBQ/007mqEAAQAAAiswIgQgF1dHqUO3cPObO3EHC/oTWEx3rc2z
+# PnxBCeDo23EEe9cwDQYJKoZIhvcNAQELBQAEggIAeJpiKWdINe+Eva7lqjN8qvqp
+# xLCe8W7rjGjFuC6yW1RIhiqiWnL7kadkj5TW3y6e0K4KGJAuaz7awlho3FO6+TCf
+# CnM4FmTL3yw6GuqfHuqZGiL/cch7Acbdy4dGCoNwHSahB/qntAdabwe57eMtSfE/
+# X+ruqtNzGfsJl5HCI7OsjMX/pMp0yZn0CI7799nSxbClyaFuzMftVtoq5xJppNAT
+# 58yFa7U5ARa5IEJEXrBiOxKUUlyP+y3ql7Gcy2bXC1uwRTs1oPjnmwDyz7w3CpyF
+# Sy0r7IL4z3172BgcuyPWPoqrzFEQZYgDLLlQ+ZRJ16tRMUy2cA2KiGwCr6hEz5Zm
+# 5E2BwcEeYq94KC9dh6oaxb+G7pvpTVn5t3jC7rJaTl7djuflDscKpY8kXd2W2kvu
+# n/hyFv/jwEQ7aFtzo93KWtZncavjJf2HGXyqkQXY0ApT9tXye5qDKUQVQXl6ObDm
+# WK8A8k3pl/EvXNz00jTpINDYk5r6ukqIM7kxAqklYUZ7+WUUbgMUXxS8qlVEwxcK
+# byyhkcqOZx3+Y7F79xLBTYBhngloHJfbnVKPtirPCqOLiFTrcOD2IiffA/9EDkjy
+# SUcwJyJ4BWDYatOEziOo2C92kAwJeEmwCzB63PgOrlf0AVOIZAS9tJ1oBhi2mWIx
+# ioZUKg2E6EqZA6KTNjg=
 # SIG # End signature block

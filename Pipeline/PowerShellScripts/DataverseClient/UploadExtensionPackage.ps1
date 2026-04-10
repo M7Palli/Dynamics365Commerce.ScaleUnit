@@ -1,19 +1,188 @@
-param(
-    [string]$AzureKeyVaultURI,
-    [string]$ApplicationId,
-    [string]$ApplicationSecretValue,
-    [string]$CertificateName,
-    [string]$Timestamp,
-    [string]$Files,
-    [string]$TimestampDigest = "sha256"
+<#
+.SYNOPSIS
+    Uploads a CSU extension package to Dataverse.
+
+.DESCRIPTION
+    Connects to the specified Dataverse environment, reads package metadata from
+    the embedded manifest.json, creates a CSU extension package record, and
+    uploads the zip file in chunked mode.
+
+.PARAMETER PackageFilePath
+    Full path to the CSU extension package zip file or the uncompressed package folder.
+    If a folder is provided, manifest.json is read from it, the folder is compressed to a
+    zip in the same parent directory (replacing any existing zip with the same name), and
+    the resulting zip is uploaded.
+
+.PARAMETER EnvironmentUrl
+    The Dataverse environment URL (e.g., https://myorg.crm.dynamics.com/).
+
+.PARAMETER TenantId
+    Azure AD tenant ID.
+
+.PARAMETER ClientId
+    Azure AD application (client) ID.
+
+.PARAMETER ClientSecret
+    Azure AD application client secret. Required if CertificateThumbprint is not provided.
+
+.PARAMETER CertificateThumbprint
+    Thumbprint of a certificate for authentication. If both CertificateThumbprint and ClientSecret are provided, certificate-based authentication (CertificateThumbprint) is used.
+
+.PARAMETER ValidationStatus
+    Validation status to stamp on the package record. Valid values: 'Valid', 'Invalid'.
+    Defaults to 'Valid'.
+#>
+param (
+    [Parameter(Mandatory)]
+    [ValidateScript({ Test-Path $_ })]
+    [String]
+    $PackageFilePath,
+
+    [Parameter(Mandatory)]
+    [ValidateNotNullOrEmpty()]
+    [String]
+    $EnvironmentUrl,
+
+    [Parameter(Mandatory)]
+    [ValidateNotNullOrEmpty()]
+    [String]
+    $TenantId,
+
+    [Parameter(Mandatory)]
+    [ValidateNotNullOrEmpty()]
+    [String]
+    $ClientId,
+
+    [Parameter()]
+    [String]
+    $ClientSecret,
+
+    [Parameter()]
+    [String]
+    $CertificateThumbprint,
+
+    [ValidateSet('Valid', 'Invalid')]
+    [String]
+    $ValidationStatus = 'Valid'
 )
 
-AzureSignTool.exe sign -kvu "$AzureKeyVaultURI" -kvi "$ApplicationId" -kvs "$ApplicationSecretValue" -kvc "$CertificateName" -tr "$Timestamp" -td "$TimestampDigest" (-split $Files)
+$ErrorActionPreference = 'Stop'
+
+Write-Host "Starting CSU extension package upload...`n"
+
+# ── Load Dataverse client modules ────────────────────────────────────────────
+. $PSScriptRoot\Common\Core.ps1
+. $PSScriptRoot\Common\CommonFunctions.ps1
+. $PSScriptRoot\Operations\ExtensionPackageOperations.ps1
+
+# ── Resolve package path ─────────────────────────────────────────────────────
+$packageItem = Get-Item $PackageFilePath
+
+if ($packageItem.PSIsContainer) {
+    # Folder: read manifest directly, then compress to zip
+    $manifestPath = Join-Path $packageItem.FullName 'manifest.json'
+    if (-not (Test-Path $manifestPath)) {
+        throw "manifest.json not found in folder: $($packageItem.FullName)"
+    }
+
+    $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+
+    $zipPath = "$($packageItem.FullName).zip"
+    $tempZipPath = "$zipPath.tmp"
+
+    Write-Host "Compressing current package folder to zip: $zipPath`n"
+    Compress-Archive -Path "$($packageItem.FullName)\*" -DestinationPath $tempZipPath -Force
+
+    if (Test-Path $zipPath) {
+        Remove-Item $zipPath -Force
+    }
+    Rename-Item -Path $tempZipPath -NewName (Split-Path $zipPath -Leaf)
+
+    $packageFile = Get-Item $zipPath
+}
+elseif ($packageItem.Extension -eq '.zip') {
+    # Zip: extract manifest from the archive
+    $packageFile = $packageItem
+
+    $tempDir = Join-Path $env:TEMP "pkg_$(Get-Date -Format 'yyyyMMddHHmmss')"
+    try {
+        Expand-Archive -Path $packageFile.FullName -DestinationPath $tempDir -Force
+
+        $manifestPath = Join-Path $tempDir 'manifest.json'
+        if (-not (Test-Path $manifestPath)) {
+            throw "manifest.json not found in package"
+        }
+
+        $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+    }
+    finally {
+        if (Test-Path $tempDir) {
+            Remove-Item $tempDir -Recurse -Force
+        }
+    }
+}
+else {
+    throw "PackageFilePath must be a folder or a .zip file. Got: $PackageFilePath"
+}
+
+# ── Validate manifest fields ─────────────────────────────────────────────────
+$requiredFields = 'customPackageName', 'customPackagePublisher', 'customPackageVersion', 'sdkVersion'
+$missingFields = $requiredFields | Where-Object { -not $manifest.$_ }
+if ($missingFields) {
+    throw "manifest.json is missing required field(s): $($missingFields -join ', ')"
+}
+
+Write-Host "Package file: $($packageFile.Name) ($([Math]::Round($packageFile.Length / 1MB, 2)) MB)"
+
+if ($packageFile.Length -gt 1GB) {
+    throw "Package file size exceeds 1 GB limit"
+}
+
+Write-Host "Package info:"
+Write-Host "  Name:        $($manifest.customPackageName)"
+Write-Host "  Publisher:   $($manifest.customPackagePublisher)"
+Write-Host "  Version:     $($manifest.customPackageVersion)"
+Write-Host "  SDK Version: $($manifest.sdkVersion)"
+if ($manifest.customPackageDescription) {
+    Write-Host "  Description: $($manifest.customPackageDescription)"
+}
+Write-Host ""
+
+# ── Connect to Dataverse ─────────────────────────────────────────────────────
+$connectParams = @{
+    environmentUrl = $EnvironmentUrl
+    tenantId       = $TenantId
+    clientId       = $ClientId
+}
+if ($CertificateThumbprint) { $connectParams.certificateThumbprint = $CertificateThumbprint }
+elseif ($ClientSecret)      { $connectParams.clientSecret = $ClientSecret }
+
+Connect @connectParams | Out-Null
+
+Write-Host "Connected as: $((Get-WhoAmI).UserId)`n"
+
+# ── Create package record and upload file ────────────────────────────────────
+$params = @{
+    PackageName      = $manifest.customPackageName
+    PackagePublisher = $manifest.customPackagePublisher
+    PackageVersion   = $manifest.customPackageVersion
+    SdkVersion       = $manifest.sdkVersion
+    ValidationStatus = $ValidationStatus
+}
+if ($manifest.customPackageDescription) {
+    $params.PackageDescription = $manifest.customPackageDescription
+}
+
+$packageId = New-CsuExtensionPackage @params
+Set-CsuExtensionPackageFile -PackageId $packageId -FilePath $packageFile.FullName
+
+Write-Host "SUCCESS: CSU extension package uploaded - $($manifest.customPackageName) ($($manifest.customPackageVersion))`n" -ForegroundColor Green
+
 # SIG # Begin signature block
 # MIIoUgYJKoZIhvcNAQcCoIIoQzCCKD8CAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAeqoz9GtLmL3Ji
-# S0sx+OrBac0lFyIiIjk31FhXBJLvw6CCDYUwggYDMIID66ADAgECAhMzAAAEhJji
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAOmwCiQ2fyZNrK
+# W3RgNpJDl1EeweedO2LXoTMTKKCH3aCCDYUwggYDMIID66ADAgECAhMzAAAEhJji
 # EuB4ozFdAAAAAASEMA0GCSqGSIb3DQEBCwUAMH4xCzAJBgNVBAYTAlVTMRMwEQYD
 # VQQIEwpXYXNoaW5ndG9uMRAwDgYDVQQHEwdSZWRtb25kMR4wHAYDVQQKExVNaWNy
 # b3NvZnQgQ29ycG9yYXRpb24xKDAmBgNVBAMTH01pY3Jvc29mdCBDb2RlIFNpZ25p
@@ -90,19 +259,19 @@ AzureSignTool.exe sign -kvu "$AzureKeyVaultURI" -kvi "$ApplicationId" -kvs "$App
 # b25kMR4wHAYDVQQKExVNaWNyb3NvZnQgQ29ycG9yYXRpb24xKDAmBgNVBAMTH01p
 # Y3Jvc29mdCBDb2RlIFNpZ25pbmcgUENBIDIwMTECEzMAAASEmOIS4HijMV0AAAAA
 # BIQwDQYJYIZIAWUDBAIBBQCgga4wGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcCAQQw
-# HAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIGre
-# 7wqeoo7R8YZTaLrHeNdmnwZ67zzKYPt6W44PmYnsMEIGCisGAQQBgjcCAQwxNDAy
+# HAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIEAW
+# 9nPAEWAtoRwb14tjR3EwwN+6lMAN8RxqbZij2mDKMEIGCisGAQQBgjcCAQwxNDAy
 # oBSAEgBNAGkAYwByAG8AcwBvAGYAdKEagBhodHRwOi8vd3d3Lm1pY3Jvc29mdC5j
-# b20wDQYJKoZIhvcNAQEBBQAEggEA6J/NMax+h7+0dhJd60vj8FmJkZp0f96yuMjT
-# wP6sWlnlEckonLvIUNToYz2WvC5uGpVi4rn2bOStMAd1+iOpprz0qDJ8p54H7LQc
-# G5OPSh3tkhaBFBZGCbMG+SSkI0P1ALovmPZufdE9c9KaeVHl1LwdWNSNa2QTcPQ9
-# QGLAiWXi2L8T02IReVZTRbxw2IHv7W85m6pi7Fp/DXRa6xuNcln+hbfyDgKD0c5j
-# 5mkgFS3/eoNXnPAfnG6werSW0QvEh407TQA+1ciuKrPcswvjXU4e8Keovf1nRaic
-# wrNmP7qVAJxWrRpEhBqpIz6lVFXN9mAql4DrwZMzQGp1NiNSy6GCF60wghepBgor
+# b20wDQYJKoZIhvcNAQEBBQAEggEAK+B+ZjW02l0WPEcJF0mHFPEN3Hjy0BhDRBiu
+# Aj2WA5u2e1Ae9i4KHJ+auYliFB5ohFUOG9zim7y5jOcF2EdN49PckTcE3FtO6uoV
+# 1VDwMmFgdTneTBRRTGE/pXWPp2f19laR7wAehThFVBWCGL+80ZHufEFEVjuRR98h
+# LOizTE2KDIN6FAQmg8XajlnHQgRnix/g7u+Flkp2jvSrVtKhKPRmYEeUhTtxDgki
+# nz5zoRtUxFG8sN1vZp1oDzZlRzfwybBAzZIn60fgjEHaC8mcSJF5hV2nABovH2Qy
+# p4oJYKZkJvfrdWSHTC4ct7qzL3MRPcMFQLEt7/TpHXto4S3ywqGCF60wghepBgor
 # BgEEAYI3AwMBMYIXmTCCF5UGCSqGSIb3DQEHAqCCF4YwgheCAgEDMQ8wDQYJYIZI
 # AWUDBAIBBQAwggFaBgsqhkiG9w0BCRABBKCCAUkEggFFMIIBQQIBAQYKKwYBBAGE
-# WQoDATAxMA0GCWCGSAFlAwQCAQUABCBCZ5hw6ioTEzUd2fMzS6tzQc6H8Jq7oca2
-# g+/Icp2hPAIGabygKKOrGBMyMDI2MDQxMDEwMTEzOS40NDdaMASAAgH0oIHZpIHW
+# WQoDATAxMA0GCWCGSAFlAwQCAQUABCDo93+dDXbzDGKCShX+r0TN18UAuB1GNFvi
+# GeSCVXaAqgIGabygKKO7GBMyMDI2MDQxMDEwMTE0MC4wOTJaMASAAgH0oIHZpIHW
 # MIHTMQswCQYDVQQGEwJVUzETMBEGA1UECBMKV2FzaGluZ3RvbjEQMA4GA1UEBxMH
 # UmVkbW9uZDEeMBwGA1UEChMVTWljcm9zb2Z0IENvcnBvcmF0aW9uMS0wKwYDVQQL
 # EyRNaWNyb3NvZnQgSXJlbGFuZCBPcGVyYXRpb25zIExpbWl0ZWQxJzAlBgNVBAsT
@@ -208,22 +377,22 @@ AzureSignTool.exe sign -kvu "$AzureKeyVaultURI" -kvi "$ApplicationId" -kvs "$App
 # BAoTFU1pY3Jvc29mdCBDb3Jwb3JhdGlvbjEmMCQGA1UEAxMdTWljcm9zb2Z0IFRp
 # bWUtU3RhbXAgUENBIDIwMTACEzMAAAIXcfsupa8BHeoAAQAAAhcwDQYJYIZIAWUD
 # BAIBBQCgggFKMBoGCSqGSIb3DQEJAzENBgsqhkiG9w0BCRABBDAvBgkqhkiG9w0B
-# CQQxIgQgC2fgSGXW7QIMcoCdgE0WmGTTsJwjrLi+DDQ+9P69zHAwgfoGCyqGSIb3
+# CQQxIgQgTjuyVx5YSFT1qDpxYQS4GfgpM4rqBuoHApRwPtLXWh8wgfoGCyqGSIb3
 # DQEJEAIvMYHqMIHnMIHkMIG9BCDQ8lBgPl23yZ0SzUSt5phOIegHPywrkNwevxe2
 # k+RaWzCBmDCBgKR+MHwxCzAJBgNVBAYTAlVTMRMwEQYDVQQIEwpXYXNoaW5ndG9u
 # MRAwDgYDVQQHEwdSZWRtb25kMR4wHAYDVQQKExVNaWNyb3NvZnQgQ29ycG9yYXRp
 # b24xJjAkBgNVBAMTHU1pY3Jvc29mdCBUaW1lLVN0YW1wIFBDQSAyMDEwAhMzAAAC
 # F3H7LqWvAR3qAAEAAAIXMCIEIDD0i6wyZHa6s6G8gshwJuS1bhKbGJ8LwHOIv7Im
-# RcaCMA0GCSqGSIb3DQEBCwUABIICACEOwkT2womLBUAozZP7UmeG7DNPdgKX7buZ
-# wnBrj1e2W4AaMRF7gXxxMYVqHQnAV/YH8pU9NpWSc35Pcr4rc0TECYzgUXgDl2Sh
-# BcML7JKnLkRKRLDz0cEFkI+rDqlP/h3KMB458zBVrA1LbsHJBmflS0jEcR8Fwehf
-# bpH+IqTkdHN0ZhRG876x6tH5fVtg4/w0xp3GU8qKwjTOF8Q6aC4cMeTUc5LuwK61
-# Ob84cEEhENGPDeHRTFaB1v6XrxSfDUOUa94CPeRFQYnw+df6ZyKYt8D8ZluyEoe4
-# xNQg/lLnsjJMKXbsyjniz1lmol47KthR8MgiL/6VcD1hWn1wsI8IWIRaQXE96Hi2
-# NDm75PIDQZ8plKZYt8madCX6JJTsguqjHmi8BgizrbVMKL9x1b4IvfkmmsfYN7Rr
-# kMGLPgBoL+PTUdZ7t4/5RIjn7EbWEjL8ND6ZuxrYOA2PbCWoGqh6kCIk7g2EWZFV
-# 48L2GNVZSGNQlDlJRMl9aY7BhXgF5zUYt/c5dRiViktQ5Wl0V6ldPUS/E3RrOAIR
-# zBnrGtmz+apeJIOKwfxBHYqtcU9aN5fQhHTEdvlY30XqiFv9XKTSUfTPAkcQcgR1
-# DB0nwwi+OKpiiZi3HQKpV+uGMP/zT4jgV65eMYz3n8aXTip/CTJonVfmGwj0rOzs
-# YYaQPzk/
+# RcaCMA0GCSqGSIb3DQEBCwUABIICACqMxK0LMbdG8CYwk8txlJ7EF4+f8jyX/alr
+# GwIPwFl4YHfNUvQXRp6gTeBjwmPRexT9N7JBbpyqJ+IBddoZJwT7t9s+/dMf7fPF
+# Gw8Nsjx5QPraSqKK9L40wXrTrllh1AcMJ81J72z0DwA1wzrs9iUbFAJblMAgef6l
+# Q+3ubER3sBw7GWZkLNxOhe3pnah18EtFpQnfNfAUP7QHotWH/kqSnlqPRiNtXaty
+# 2hmW0kbGkgGOYVYM8dP+3xntWucMRqaBPpjGjejhZiWUuG5po+pCwSetdihcqJ8P
+# BOuejiy+NvohkqbAy6dQ7/fVBVpLWS6616A8WMJD+X3DPbqLAG3zTTtcbxwd+7nX
+# I6XNBICyLK1creCs8iPE5a4tnIKoiAGT7niUdBneZ5jsuKY5Ix6xaEd40CTeKoq0
+# p7mlJByDnWGT3a3q9h99EYq2sONT3Y8YRIuC9+N9LZVQnfxOB2nba8GZJyswNpum
+# Ihv7Tr3z1PDC37ObJ9pNPhRHXa1Xq8QDh4WPlOPnu3qOgJIDMPOirxmWCKTszdzF
+# t79j5wsKCkrLtyyxLIogJt8kRtA91PKUo/4y+B2mV8RxKxpvYdSGQWMaYiOUbigW
+# 0+mjYHJ+4nlRiSEsH+zimaLLSWeCPaLqZofS0W4LiOE5YAo3bdzDsAZ+IZv1EcT5
+# ZKEhRxbW
 # SIG # End signature block
