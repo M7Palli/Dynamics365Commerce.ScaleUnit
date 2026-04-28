@@ -1,47 +1,144 @@
-<#
-.SYNOPSIS
-Uninstalls the Commerce Scale Unit Sample Extension.
-#>
-Import-Module (Join-Path $PSScriptRoot "ErrorDecorator.psm1")
+function Connect {
+    param (
+        [Parameter(Mandatory)]
+        [String]
+        $environmentUrl,
 
-$workspaceFolder = $Env:common_workspaceFolder
-$NewLine = [Environment]::NewLine
+        [Parameter(Mandatory)]
+        [String]
+        $tenantId,
 
-Write-Host
-$InstallerPath = Join-Path $workspaceFolder "Installer\bin\Debug\net472\ScaleUnit.Sample.Installer.exe"
-if (Test-Path -Path $InstallerPath) {
-    Write-Host "Uninstalling the extension."
-    & "$InstallerPath" uninstall
-    if ($LastExitCode -ne 0) {
-        $message = "The extension uninstallation has failed with exit code $LastExitCode."
-        $selfHostProcessName = "Microsoft.Dynamics.Retail.RetailServerSelfHost.AspNetCore"
-        $selfHostProcess = Get-Process "$selfHostProcessName" -ErrorAction SilentlyContinue
-        if (-not $selfHostProcess)
-        {
-            $message += " Please examine the above logs to fix a problem and then try uninstalling again."
+        [Parameter(Mandatory)]
+        [String]
+        $clientId,
+
+        [Parameter()]
+        [String]
+        $clientSecret,
+
+        [Parameter()]
+        [String]
+        $certificateThumbprint
+    )
+
+    if (-not $certificateThumbprint -and -not $clientSecret) {
+        throw "Either 'certificateThumbprint' or 'clientSecret' must be provided."
+    }
+
+    try {
+        # Ensure environmentUrl ends with /
+        if (-not $environmentUrl.EndsWith('/')) {
+            $environmentUrl += '/'
         }
-        else
-        {
-            # The self-host process is running, this may indicate that the debug session is still active
-            # or the self-host process is running in the background.
-            $message += $NewLine + "The process '$selfHostProcessName' is running now."
-            $message += $NewLine + "If the debugger is attached to Scale Unit make sure to stop debugging session and then try uninstalling again."
+
+        $tokenEndpoint = "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token"
+        Write-Host "Requesting token from $tokenEndpoint"
+
+        # Build token request body — prefer certificate over client secret
+        if ($certificateThumbprint) {
+            $cert = 'CurrentUser', 'LocalMachine' |
+                ForEach-Object { Get-Item "Cert:\$_\My\$certificateThumbprint" -ErrorAction SilentlyContinue } |
+                Select-Object -First 1
+
+            if (-not $cert) {
+                throw "Certificate with thumbprint '$certificateThumbprint' not found in CurrentUser or LocalMachine stores."
+            }
+
+            $now = Get-Date
+            Write-Host "Using certificate: $($cert.Subject) ($($cert.Thumbprint), expires $($cert.NotAfter.ToString('yyyy-MM-dd')))"
+
+            if ($cert.NotAfter -lt $now) {
+                throw "Certificate '$($cert.Thumbprint)' expired on $($cert.NotAfter.ToString('yyyy-MM-dd'))."
+            }
+            elseif ($cert.NotAfter -lt $now.AddDays(30)) {
+                Write-Warning "Certificate '$($cert.Thumbprint)' expires on $($cert.NotAfter.ToString('yyyy-MM-dd')), which is within 30 days."
+            }
+
+            $body = @{
+                client_id             = $clientId
+                client_assertion      = New-ClientAssertion -cert $cert -clientId $clientId -tokenEndpoint $tokenEndpoint
+                client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
+                scope                 = "${environmentUrl}.default"
+                grant_type            = 'client_credentials'
+            }
         }
-        Write-Host
-        Write-CustomError $message
-        Write-Host
-        exit $LastExitCode
+        else {
+            $body = @{
+                client_id     = $clientId
+                client_secret = $clientSecret
+                scope         = "${environmentUrl}.default"
+                grant_type    = 'client_credentials'
+            }
+        }
+
+        $tokenResponse = Invoke-RestMethod -Uri $tokenEndpoint `
+            -Method Post `
+            -Body $body `
+            -ContentType "application/x-www-form-urlencoded" `
+            -ErrorAction Stop
+
+        # Define common set of headers
+        $global:baseHeaders = @{
+            'Authorization'    = "Bearer $($tokenResponse.access_token)"
+            'Accept'           = 'application/json'
+            'OData-MaxVersion' = '4.0'
+            'OData-Version'    = '4.0'
+            'Content-Type'     = 'application/json; charset=utf-8'
+        }
+
+        # Set baseURI
+        $global:baseURI = "${environmentUrl}api/data/v9.2/"
+
+        Write-Host "Successfully connected to $environmentUrl" -ForegroundColor Green
+        Write-Verbose "Base URI set to: $global:baseURI"
+
+        # Return connection info (without sensitive data)
+        return @{
+            Connected    = $true
+            BaseURI      = $global:baseURI
+            TokenExpires = (Get-Date).AddSeconds($tokenResponse.expires_in)
+        }
+    }
+    catch {
+        Write-Error "Failed to connect to Dataverse: $($_.Exception.Message)"
+        throw
     }
 }
-else {
-    Write-Host "The extension installer was not found in "$workspaceFolder\Installer\bin\Debug\net472\" directory."
-}
 
+function New-ClientAssertion {
+    param (
+        [Parameter(Mandatory)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]
+        $cert,
+
+        [Parameter(Mandatory)]
+        [String]
+        $clientId,
+
+        [Parameter(Mandatory)]
+        [String]
+        $tokenEndpoint
+    )
+
+    $x5t = [Convert]::ToBase64String($cert.GetCertHash()).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+
+    $now = [DateTimeOffset]::UtcNow
+    $header  = @{ alg = 'RS256'; typ = 'JWT'; x5t = $x5t } | ConvertTo-Json -Compress
+    $payload = @{ aud = $tokenEndpoint; iss = $clientId; sub = $clientId; jti = [Guid]::NewGuid().ToString(); nbf = $now.ToUnixTimeSeconds(); exp = $now.AddMinutes(10).ToUnixTimeSeconds() } | ConvertTo-Json -Compress
+
+    $toBase64Url = { param($bytes) [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_') }
+    $unsigned = "$(& $toBase64Url ([Text.Encoding]::UTF8.GetBytes($header))).$(& $toBase64Url ([Text.Encoding]::UTF8.GetBytes($payload)))"
+
+    $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
+    $sig = $rsa.SignData([Text.Encoding]::UTF8.GetBytes($unsigned), [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1)
+
+    return "$unsigned.$(& $toBase64Url $sig)"
+}
 # SIG # Begin signature block
 # MIInSQYJKoZIhvcNAQcCoIInOjCCJzYCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAph3AfI2qyYDSP
-# fmcFPt/joSgr6dhReFGG75jC3TT/XqCCDLowggX1MIID3aADAgECAhMzAAACHU0Z
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCByBPpkDip3Yj1d
+# 1qmahJ6JenWB6bm77OuWnpjIFAdyMaCCDLowggX1MIID3aADAgECAhMzAAACHU0Z
 # yE7XD1dIAAAAAAIdMA0GCSqGSIb3DQEBCwUAMFcxCzAJBgNVBAYTAlVTMR4wHAYD
 # VQQKExVNaWNyb3NvZnQgQ29ycG9yYXRpb24xKDAmBgNVBAMTH01pY3Jvc29mdCBD
 # b2RlIFNpZ25pbmcgUENBIDIwMjQwHhcNMjYwNDE2MTg1OTQzWhcNMjcwNDE1MTg1
@@ -113,19 +210,19 @@ else {
 # MR4wHAYDVQQKExVNaWNyb3NvZnQgQ29ycG9yYXRpb24xKDAmBgNVBAMTH01pY3Jv
 # c29mdCBDb2RlIFNpZ25pbmcgUENBIDIwMjQCEzMAAAIdTRnITtcPV0gAAAAAAh0w
 # DQYJYIZIAWUDBAIBBQCgga4wGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYK
-# KwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIM5HLXkN
-# JTfU6yHhCFrmDkAUopMoqndjFMfTp50gAf8gMEIGCisGAQQBgjcCAQwxNDAyoBSA
+# KwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIB9YhCYf
+# o7TLj5cYd/r/heygqBLAon1oSImK7KVim0lmMEIGCisGAQQBgjcCAQwxNDAyoBSA
 # EgBNAGkAYwByAG8AcwBvAGYAdKEagBhodHRwOi8vd3d3Lm1pY3Jvc29mdC5jb20w
-# DQYJKoZIhvcNAQEBBQAEggEAKuAqYF36naMEThBUENVSegIM62Lv8ojKgI1X4g/a
-# PEKqLBb5ERlj8EaKMBge5kA56g6z9PhYmM+fGQ/uhRwDsmUE69aKBMRXYH5xihf7
-# MkV9DfQXsV42nbztlj6kwHvlmVylqKsnXOF1tqRFGb/D+OOozulZsRlzhDCtyzBa
-# w44U3dI1HmC1x0i5uxmbzcYZnbx59FGR9otVfc1k4I6KdqXelfL5irtOmEpdZqUV
-# yojwPnMAhyMgGEruzuZIwjzM+SNAyf1X1mCjl/7I35kmm1UJph9XcM0L2ZRx5MXZ
-# iOLyfB4r1vUNIn/mRqkakJXm2rtx3gQuIKgTn84KVv1pCKGCF5cwgheTBgorBgEE
+# DQYJKoZIhvcNAQEBBQAEggEAN4YcUKzRZqZeuFP4VDIWq42L1oFzjn2TQhK+hBTM
+# BKg0fuRhpbqowY03UUMj98Pn9/lGn1V6DC1sCYbvSSWZp8v/xeai/OlYj1Yz4yCi
+# mxY3+FTzscGfoLlClL02VGSNNV+H1Zo4Vf0ns7Pj1oogOWOH2tl6vQsfBC4Risu6
+# 6mnPQ8HXAFUlGm6iCNBIotFpE9BueGhOylE3O7d62yscdEmZdf8AKVdvoP1znAI5
+# BIVqv8FFRFkNUfGanyztDmpYBKmUeu/AzWBltCerCg9UjgxwgTlB1RSYRa1E9zMd
+# xlu88p94hT3zFJ+rV1DT3JYqnt+k31x4BiSAEtsMjshSe6GCF5cwgheTBgorBgEE
 # AYI3AwMBMYIXgzCCF38GCSqGSIb3DQEHAqCCF3AwghdsAgEDMQ8wDQYJYIZIAWUD
 # BAIBBQAwggFSBgsqhkiG9w0BCRABBKCCAUEEggE9MIIBOQIBAQYKKwYBBAGEWQoD
-# ATAxMA0GCWCGSAFlAwQCAQUABCDFwx+zMSv9YS06qMRX5CU8xY5MQj8PJ1wHs3/G
-# 6qYr5AIGaeeMRG1NGBMyMDI2MDQyODEwMTAwOC41ODJaMASAAgH0oIHRpIHOMIHL
+# ATAxMA0GCWCGSAFlAwQCAQUABCCukBE/KVnbk3ty8SMNX0+zdvgyH7ch78UbKv1z
+# NS471AIGaeeMRG01GBMyMDI2MDQyODEwMTAwNy45MzZaMASAAgH0oIHRpIHOMIHL
 # MQswCQYDVQQGEwJVUzETMBEGA1UECBMKV2FzaGluZ3RvbjEQMA4GA1UEBxMHUmVk
 # bW9uZDEeMBwGA1UEChMVTWljcm9zb2Z0IENvcnBvcmF0aW9uMSUwIwYDVQQLExxN
 # aWNyb3NvZnQgQW1lcmljYSBPcGVyYXRpb25zMScwJQYDVQQLEx5uU2hpZWxkIFRT
@@ -230,22 +327,22 @@ else {
 # MA4GA1UEBxMHUmVkbW9uZDEeMBwGA1UEChMVTWljcm9zb2Z0IENvcnBvcmF0aW9u
 # MSYwJAYDVQQDEx1NaWNyb3NvZnQgVGltZS1TdGFtcCBQQ0EgMjAxMAITMwAAAiQ7
 # hCGwLKxkIgABAAACJDANBglghkgBZQMEAgEFAKCCAUowGgYJKoZIhvcNAQkDMQ0G
-# CyqGSIb3DQEJEAEEMC8GCSqGSIb3DQEJBDEiBCCiju4QX/i4uc9nreBVxpV/8bS3
-# pyzGnFfFGo9r95fFETCB+gYLKoZIhvcNAQkQAi8xgeowgecwgeQwgb0EIEghPTdq
+# CyqGSIb3DQEJEAEEMC8GCSqGSIb3DQEJBDEiBCBQfZcFsHbonpIgmM6Yyof4iRfv
+# zKz4eXX+c8GVSa1jAzCB+gYLKoZIhvcNAQkQAi8xgeowgecwgeQwgb0EIEghPTdq
 # m/dRyZ0BczXcdloVEqICdcmpVNbH9CEVzWSOMIGYMIGApH4wfDELMAkGA1UEBhMC
 # VVMxEzARBgNVBAgTCldhc2hpbmd0b24xEDAOBgNVBAcTB1JlZG1vbmQxHjAcBgNV
 # BAoTFU1pY3Jvc29mdCBDb3Jwb3JhdGlvbjEmMCQGA1UEAxMdTWljcm9zb2Z0IFRp
 # bWUtU3RhbXAgUENBIDIwMTACEzMAAAIkO4QhsCysZCIAAQAAAiQwIgQg26wMrjjH
-# W6yv19IJdFo/r/GajX7IzUEHiZTofh0zWNcwDQYJKoZIhvcNAQELBQAEggIAgvj7
-# td9BlHvMYOnEfSB6lO2S2m5CU6LHbGV71R33WRn4xyGgR67PvzOOJ8RJI3pkGip/
-# cDmLyrW72eus4TqMsug6FQ2PcghO7M7A1QCfEIzkQX5Sns6tHoH4W+bs1X6cLqzb
-# a9H0sOXeRhWKwBlj/QqSvewsS/77MXnYBhrOb/ZYrRa6fcEGE/EhrDN/gCR/f+cE
-# nRBXe3djzS1x0/kYra5fI9xs5ixIV01cAfNlFz/n5Xm8myOmPu6atYHLyJK1SqHv
-# zaXDpLUV8HTNj/sqq0clEEBQDzvh0+k1ECG19AQOpQB5wlvzhylTIVjGB2tJ9S6e
-# sZpcACN9iXPJv99/5t4yVJ6VBtyoaLVIEnSe/jb89WA6OiHyrO68CASli147NzZF
-# fWZ9oBoj8tEHD8edHcanjeaOT3Keve4CBwWNfdSuidyJuUT5nZHUNfq03yqt5IRI
-# WT49jRJyjZPV1bZIBBnWtcIzTa04Q86+31vkA3rLQz4Mbk9X5cXfCNi2tIHZ4f13
-# OIEizDMDVB0vF6mSphSEOmodLfdcWsY5gXis/FRrufAqSOjJqU2LA0XwH+3zfZKh
-# ZUSnbTYy1l58cyjCaT5SO8mE0de4XVDBrpx9G5DpXtpVFqvMRfGoqQFX+8vfzKEH
-# h3WNlaMlhErwEss0irTvnGJ1EkZMHwWVyIvjw64=
+# W6yv19IJdFo/r/GajX7IzUEHiZTofh0zWNcwDQYJKoZIhvcNAQELBQAEggIAUkYA
+# XV6lfbMYJsDae4AN3adOwqc+XtrPmF3VdT5u5574V88exdURmB9Vq9zMSlgh4qaz
+# qqKBCJTNeRjYCN03EamzTlsSiGav/82k/SokEM0gDbOhDXcIaM43QliA5RAUBFy3
+# 30N1fklzrcjEKOvb6fdFLzeri3WH4Dg32vYoqQ8phDozZqrTKCSi5UDNkzMoUFvr
+# VLy5MiCy5ctBjpbEHGle14HlnnPE5Ag9C/RU4WpgIOcKpIJ3Zx60q6qB3x1rLORt
+# X+JalurRa83/2LG7VMQYR1+Qbbt29XuJGxlNNF96AR/s5aG5Na3xgVCgNG2GZnOM
+# NP7tcvEUiu800pj4nhg0fnA3OwDyeUsK+P3BcH0fs2sQhAzK2QmTPgYKOsX7/eoC
+# WFi9OYHh69xaeG8zJnZ8e/DgMs01WCsvllriQeQAS7fTWraBcPGACvHoVAG1WGH/
+# RPEhOpg5rBOUFCBO0cI+96yq2NdYBzBhWYiQyIxtVwbUIFl1sKTuCDec7x3ZTFgx
+# zE/NJE/7o2UgHS8hrQ0a9+QIVF6L76XuHqR1vEvlbpHJi5mN2bt7l32KhyxdPjAG
+# EJwlhPIsGWJkZSzMamnjcDi21nbdNVAIvx0ew/7HL3TtIaA4gZbRc10yStW43w0J
+# oidc9GOVxu96GealazZd16UCjLIvdUg7b9o9ML4=
 # SIG # End signature block

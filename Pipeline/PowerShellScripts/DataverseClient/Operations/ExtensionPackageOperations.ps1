@@ -1,19 +1,182 @@
-param(
-    [string]$AzureKeyVaultURI,
-    [string]$ApplicationId,
-    [string]$ApplicationSecretValue,
-    [string]$CertificateName,
-    [string]$Timestamp,
-    [string]$Files,
-    [string]$TimestampDigest = "sha256"
-)
+. $PSScriptRoot\TableOperations.ps1
+. $PSScriptRoot\FileOperations.ps1
 
-AzureSignTool.exe sign -kvu "$AzureKeyVaultURI" -kvi "$ApplicationId" -kvs "$ApplicationSecretValue" -kvc "$CertificateName" -tr "$Timestamp" -td "$TimestampDigest" (-split $Files)
+function New-CsuExtensionPackage {
+    param (
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $PackageName,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $PackagePublisher,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $PackageVersion,
+
+        [Parameter()]
+        [String]
+        $SdkVersion,
+
+        [Parameter()]
+        [ValidateSet('Valid', 'Invalid')]
+        [String]
+        $ValidationStatus,
+
+        [Parameter()]
+        [String]
+        $PackageDescription
+    )
+
+    try {
+        $body = @{
+            msprov_name       = $PackageName
+            msprov_publisher  = $PackagePublisher
+            msprov_version    = $PackageVersion
+            msprov_sdkversion = $SdkVersion
+            msprov_assettype  = 0 # CSU Extension Package
+        }
+
+        # Add optional fields if provided
+        if ($ValidationStatus) {
+            $statusValue = switch ($ValidationStatus) {
+                'Valid'   { 202570000 }
+                'Invalid' { 202570001 }
+            }
+            $body['msprov_commerceextensionasset_validationstatus'] = $statusValue
+        }
+
+        if ($PackageDescription) {
+            $body['msprov_description'] = $PackageDescription
+        }
+
+        Write-Host "Creating CSU extension package record: $PackageName ($PackageVersion)"
+
+        $recordId = New-Record -setName 'msprov_commerceextensionassets' -body $body
+
+        Write-Host "Successfully created CSU extension package record with ID: $recordId`n" -ForegroundColor Green
+        return $recordId
+    }
+    catch {
+        Write-Error "Failed to create CSU extension package record $PackageName ($PackageVersion): $($_.Exception.Message)`n"
+        throw
+    }
+}
+
+function Set-CsuExtensionPackageFile {
+    param (
+        [Parameter(Mandatory)]
+        [System.Guid]
+        $PackageId,
+
+        [Parameter(Mandatory)]
+        [ValidateScript({ Test-Path $_ -PathType Leaf })]
+        [String]
+        $FilePath,
+
+        [Parameter()]
+        [String]
+        $ColumnName = 'msprov_payload'
+    )
+
+    try {
+        $fileInfo = Get-Item -Path $FilePath
+        $fileSizeMB = [Math]::Round($fileInfo.Length / 1MB, 2)
+
+        Write-Host "Uploading CSU extension package file: $($fileInfo.Name) ($fileSizeMB MB)"
+
+        Set-FileColumnInChunks -setName 'msprov_commerceextensionassets' `
+            -id $PackageId `
+            -columnName $ColumnName `
+            -file $fileInfo
+
+        Write-Host "Successfully uploaded CSU extension package file to record: $PackageId`n" -ForegroundColor Green
+    }
+    catch {
+        Write-Error "Failed to upload CSU extension package file: $($_.Exception.Message)`n"
+        throw
+    }
+}
+
+function Get-CsuExtensionPackage {
+    param (
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $PackageName,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $PackageVersion
+    )
+
+    try {
+        Write-Host "Querying CSU extension package: $PackageName ($PackageVersion)"
+
+        $escapedPackageName = $PackageName.Replace("'", "''")
+        $escapedPackageVersion = $PackageVersion.Replace("'", "''")
+        $filter = "?`$filter=msprov_name eq '$escapedPackageName' and msprov_version eq '$escapedPackageVersion' and msprov_assettype eq 0"
+        $response = Get-Records -setName 'msprov_commerceextensionassets' -query $filter
+
+        $records = $response.value
+
+        if (-not $records -or $records.Count -eq 0) {
+            Write-Host "No CSU extension package found: $PackageName ($PackageVersion)" -ForegroundColor Yellow
+            return $null
+        }
+
+        Write-Host "Found $($records.Count) CSU extension package record(s): $PackageName ($PackageVersion)`n" -ForegroundColor Green
+        return $records
+    }
+    catch {
+        Write-Error "Failed to query CSU extension package $PackageName ($PackageVersion): $($_.Exception.Message)`n"
+        throw
+    }
+}
+
+function Get-CsuExtensionPackageFile {
+    param (
+        [Parameter(Mandatory)]
+        [System.Guid]
+        $PackageId,
+
+        [Parameter(Mandatory)]
+        [ValidateScript({ Test-Path $_ -PathType Container })]
+        [String]
+        $OutputDirectory,
+
+        [Parameter()]
+        [String]
+        $ColumnName = 'msprov_payload'
+    )
+
+    try {
+        Write-Host "Downloading CSU extension package file from record: $PackageId"
+
+        $file = Get-FileColumnInChunks -setName 'msprov_commerceextensionassets' `
+            -id $PackageId `
+            -columnName $ColumnName `
+            -outputDirectory $OutputDirectory
+
+        Write-Host "Successfully downloaded CSU extension package file: $($file.Name)`n" -ForegroundColor Green
+        return $file
+    }
+    catch {
+        Write-Error "Failed to download CSU extension package file: $($_.Exception.Message)`n"
+        throw
+    }
+}
+
 # SIG # Begin signature block
 # MIInRgYJKoZIhvcNAQcCoIInNzCCJzMCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAeqoz9GtLmL3Ji
-# S0sx+OrBac0lFyIiIjk31FhXBJLvw6CCDLowggX1MIID3aADAgECAhMzAAACHU0Z
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCkH0lDp4vhyVxg
+# HqQpKbs8RRWIikHX+xG/HV6lxe2g+KCCDLowggX1MIID3aADAgECAhMzAAACHU0Z
 # yE7XD1dIAAAAAAIdMA0GCSqGSIb3DQEBCwUAMFcxCzAJBgNVBAYTAlVTMR4wHAYD
 # VQQKExVNaWNyb3NvZnQgQ29ycG9yYXRpb24xKDAmBgNVBAMTH01pY3Jvc29mdCBD
 # b2RlIFNpZ25pbmcgUENBIDIwMjQwHhcNMjYwNDE2MTg1OTQzWhcNMjcwNDE1MTg1
@@ -85,19 +248,19 @@ AzureSignTool.exe sign -kvu "$AzureKeyVaultURI" -kvi "$ApplicationId" -kvs "$App
 # MR4wHAYDVQQKExVNaWNyb3NvZnQgQ29ycG9yYXRpb24xKDAmBgNVBAMTH01pY3Jv
 # c29mdCBDb2RlIFNpZ25pbmcgUENBIDIwMjQCEzMAAAIdTRnITtcPV0gAAAAAAh0w
 # DQYJYIZIAWUDBAIBBQCgga4wGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYK
-# KwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIGre7wqe
-# oo7R8YZTaLrHeNdmnwZ67zzKYPt6W44PmYnsMEIGCisGAQQBgjcCAQwxNDAyoBSA
+# KwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIEmTHlnv
+# A3iWfg047E+x1uVZorkKLLnmEix29tMQH/fnMEIGCisGAQQBgjcCAQwxNDAyoBSA
 # EgBNAGkAYwByAG8AcwBvAGYAdKEagBhodHRwOi8vd3d3Lm1pY3Jvc29mdC5jb20w
-# DQYJKoZIhvcNAQEBBQAEggEAcKx1c1tjSP5y6TtJAGiQa/ML/jbcjtKrhDQN4+hi
-# OBdqxK3Q8jLkQGYCYlnE/mAyAOWKrs5DaEMNvINOXDTCtCAn3hIE9VdkAhtDnBq9
-# tUaF6LyPtmFX50WbRbxvGo3voGOhuTwnptjaib0Qg+ZMqne5NhvFV07fmnP0aDsB
-# oe2rb91zetDSuRvZjMt9GbbCOnkNh+pIzJNQferpAZdxPyACTfVAmzJH2ot5W79/
-# Nrc5v25VncoevJt71xCCh/PVURIJ10ugs0FHm0mTqeiY4Stbgwg66N3nV5xOkHOa
-# 0JTCz/xPRaJFBGUSxC6cxw7inivAzgaVT79RFhFyGJozo6GCF5QwgheQBgorBgEE
+# DQYJKoZIhvcNAQEBBQAEggEAb8rTE/kWpDvFU6Bh2nXAM3KgX8/ViXlCPpScmUF7
+# qL9EPRq1/GuRo3P8rEbHdbE05Fs9eSQCH1R6facEaCOTRfcUnGNUUsPG85W7898E
+# WseOM2O7enlpoIaHybFyHUf+lmiVWs2np5oudOufNVGNlqpaMx2iFiBm6hwDRItz
+# Zvpomyc4ug2l/uar3WdJmitAU0P+7XCmRGYxWONkIO39dj4GC8bAH9oTRmgSq+5M
+# Mxz4UB8t18Z0fOyUYxMRk88k6Woyh6jYIayDEcJzAZi5dtWdvJS1aK8Vdukt2qKD
+# iXjorxocq6ma3zjZ84QRaT332b8xwaG8ADQmVdvytrGcUKGCF5QwgheQBgorBgEE
 # AYI3AwMBMYIXgDCCF3wGCSqGSIb3DQEHAqCCF20wghdpAgEDMQ8wDQYJYIZIAWUD
 # BAIBBQAwggFSBgsqhkiG9w0BCRABBKCCAUEEggE9MIIBOQIBAQYKKwYBBAGEWQoD
-# ATAxMA0GCWCGSAFlAwQCAQUABCDxWbZ6d4PeWKwma4azK1C1OS5Wnjg46KP5opP4
-# 8lNlEQIGaed7wY/RGBMyMDI2MDQyODEwMTAwOC4xNjJaMASAAgH0oIHRpIHOMIHL
+# ATAxMA0GCWCGSAFlAwQCAQUABCDKgcEVRHu4nBSa6Iohxs0CaKwQe+3nHhkkE7a2
+# 3YjLPQIGaed7wY/pGBMyMDI2MDQyODEwMTAwOC42NTRaMASAAgH0oIHRpIHOMIHL
 # MQswCQYDVQQGEwJVUzETMBEGA1UECBMKV2FzaGluZ3RvbjEQMA4GA1UEBxMHUmVk
 # bW9uZDEeMBwGA1UEChMVTWljcm9zb2Z0IENvcnBvcmF0aW9uMSUwIwYDVQQLExxN
 # aWNyb3NvZnQgQW1lcmljYSBPcGVyYXRpb25zMScwJQYDVQQLEx5uU2hpZWxkIFRT
@@ -202,22 +365,22 @@ AzureSignTool.exe sign -kvu "$AzureKeyVaultURI" -kvi "$ApplicationId" -kvs "$App
 # A1UEBxMHUmVkbW9uZDEeMBwGA1UEChMVTWljcm9zb2Z0IENvcnBvcmF0aW9uMSYw
 # JAYDVQQDEx1NaWNyb3NvZnQgVGltZS1TdGFtcCBQQ0EgMjAxMAITMwAAAiWAxzfG
 # zap3SQABAAACJTANBglghkgBZQMEAgEFAKCCAUowGgYJKoZIhvcNAQkDMQ0GCyqG
-# SIb3DQEJEAEEMC8GCSqGSIb3DQEJBDEiBCDmHyqmdG/VOAb2VpJsvl82J8oE389W
-# k7sPiTUtFOFvSDCB+gYLKoZIhvcNAQkQAi8xgeowgecwgeQwgb0EIFYN7oh6ON3y
+# SIb3DQEJEAEEMC8GCSqGSIb3DQEJBDEiBCAlSiaRlgVe8wKdm4N4d6+o+uLUb7qE
+# QlhWNH9LX+mSEDCB+gYLKoZIhvcNAQkQAi8xgeowgecwgeQwgb0EIFYN7oh6ON3y
 # 92CmAl/lF0CYwrjWWQP6dCUxajPSHKEQMIGYMIGApH4wfDELMAkGA1UEBhMCVVMx
 # EzARBgNVBAgTCldhc2hpbmd0b24xEDAOBgNVBAcTB1JlZG1vbmQxHjAcBgNVBAoT
 # FU1pY3Jvc29mdCBDb3Jwb3JhdGlvbjEmMCQGA1UEAxMdTWljcm9zb2Z0IFRpbWUt
 # U3RhbXAgUENBIDIwMTACEzMAAAIlgMc3xs2qd0kAAQAAAiUwIgQgxK1oMUgtrXLF
-# SGov5ArTftEKucm3OfQhR2hxHAWSzrIwDQYJKoZIhvcNAQELBQAEggIAS1xRXJqs
-# 1etZj7Q3Az7C7iw1qHqgvSB3dg0QRaMc4sWbwK3gOI5zoetgSeWsIHIt6vQ4CTwQ
-# FHfZ1HvmsdAb/6CAqUd6j4BsDtId5V1io2Y03FzzKz5ELNEqiMtYvzwOACbbBaxx
-# EAjE6Pt4I/U4z/HQnccjeUczCdhZ+miEU9xarq4kSbJTuUf8AxzQgYimuWZ8FI3h
-# X31Aj4XycA4tnFSAkNeWeYAv+MR3SFhXyU9x2Iix5g/7hhyUrPZywBdFQnS4LnkI
-# rWrgIDNiCxTnf+Adr7idcn8kahUA+QX+WwnWmWVl+dY/vvJU6AIJlDzTtukIPyo3
-# 7ER0Nl1/Q9U2Y6GqUdummTspnptqt5JpHw9TagREkvdRjSRJhTupzs/ymCYcZN2/
-# ts3UyCL8LE5enGE939cUyMVTJea/afCUCVgR2kROf3Y+GDMRNugExS0qhrLr0S+a
-# Qx2jvAL6zw16UDNUApV+t9CBCcKNj10jFGai+Ha4NnBltC5MvLO0R+rcgwjUNAug
-# vGa/EPe+hluOmw5qzGA1ehUJ9c9xHBuLamYuWDu6uLOAI+RU6vuu/JlOzHDqJVt4
-# DLwK0Wmu48YOGkruPv5MDsoKF5h055PDfeBXGiKeFbcD4OcKwCP4TxJA9o3AI851
-# l+8SEriWIgt2kfgcO8lhUn9hCQqXU2QETzU=
+# SGov5ArTftEKucm3OfQhR2hxHAWSzrIwDQYJKoZIhvcNAQELBQAEggIAiKD4Pygb
+# szi0XDZMJx7gCgusfQg6MB+HqZf63MBb+H8i3gGWLC9Bgx+3V5VTSKBschEQEA3y
+# hfusoWfNdkF+2v/WvqXESb9E06uJV+hhSlnwGVT80WjNDnmdxE30DLM4OghWWXTF
+# kijqQDU912cpWuhzNWW5wN1ACiLB2ctSDYnMNzs5LWKpwKV0DCMriX1LRSzMOdcG
+# E3uVTEnGZIVzvHyHtmc5LXFiqrjBddQx23M8jpUlFAoo9XrtESwlal/rE7x118Nc
+# po5DkxU/aSPoC7EKDxIYfupTdJJWE/JjI8szogtM27XtadECowQR1RiVmoKtp0B8
+# 03kBZn9EY6vKd0Mu1N0hquqCYHdnp25xtX8Sjzeel68StFkwblbWKUuoj5Ripi7F
+# ShxirSFVwFPmsxTN7FWJ5D0r9y5m4wwpp3Hlu94OsXEWhbyiRbZUkOY0qFlrIwTB
+# f+CILXMpyroibOwEEPtAxOMJnZjVqXrfVf6Gm9y0CLIFWJZnDB2l9SjzPaqjbPLS
+# TivklNLcIh6Gv0T8nT2Fp/UJDqhmK8kl9Z/3xHN0eG6A1BBJlGV987NFFQ3NGHhh
+# WwFsZk8ObC4uFjngk8X+aQ/f6suRX2hw7CK2zBVndUYjNI75uvRbwZl9CzLjGppD
+# EbRmxgFvD5AlntPr8XvM7j73QIPqPWYydeg=
 # SIG # End signature block

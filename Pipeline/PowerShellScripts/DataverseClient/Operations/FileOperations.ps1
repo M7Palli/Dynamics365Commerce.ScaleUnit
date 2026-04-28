@@ -1,113 +1,181 @@
-using namespace System.Security.Cryptography.X509Certificates
-
-<#
-.SYNOPSIS
-Ensure that the certificate exists, if the certificate is missing, create one.
-
-.DESCRIPTION
-Ensure that the certificate exists, if the certificate is missing, create one.
-
-.PARAMETER CheckOnly
-Only check the certificate existence, do not create anything.
-#>
-[CmdletBinding()]
-param(
-    [switch]
-    $CheckOnly
-)
-Import-Module (Join-Path $PSScriptRoot "ErrorDecorator.psm1")
-
-function Get-CertificatesFromStore {
-    param(
-        [StoreLocation]
-        $StoreLocation = [StoreLocation]::LocalMachine,
-
-        [StoreName]
-        $StoreName = [StoreName]::My,
-
+function Set-FileColumnInChunks {
+    param (
+        [Parameter(Mandatory)]
         [string]
-        [Parameter(Mandatory = $true)]
-        $SubjectName
+        $setName,
+
+        [Parameter(Mandatory)]
+        [System.Guid]
+        $id,
+
+        [Parameter(Mandatory)]
+        [string]
+        $columnName,
+
+        [Parameter(Mandatory, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [System.IO.FileInfo]
+        $file
     )
 
-    Write-Verbose "Checking for $SubjectName on local store"
-    $store = [X509Store]::new($StoreName, $StoreLocation)
+    $uri = '{0}{1}({2})' -f $baseURI, $setName, $id
+    $uri += '/{0}?x-ms-file-name={1}' -f $columnName, $file.Name
+
+    $chunkHeaders = $baseHeaders.Clone()
+    $chunkHeaders['x-ms-transfer-mode'] = 'chunked'
+
+    $InitializeChunkedFileUploadRequest = @{
+        Uri     = $uri
+        Method  = 'Patch'
+        Headers = $chunkHeaders
+    }
+
+    Invoke-RestMethod @InitializeChunkedFileUploadRequest -ResponseHeadersVariable rhv | Out-Null
+
+    $locationUri = $rhv['Location'][0]
+    $chunkSize = [int]$rhv['x-ms-chunk-size'][0]
+
+    Write-Host "Chunk size: $([Math]::Round($chunkSize / 1MB, 2)) MB"
+
+    $stream = [System.IO.File]::OpenRead($file.FullName)
     try {
-        $store.Open([OpenFlags]::ReadOnly)
-        $store.Certificates | Where-Object { $_.Subject -eq $SubjectName -and $_.NotAfter -gt (Get-Date) }
-    } finally {
-        if ($store) {
-            $store.Dispose()
+        $fileSize = $stream.Length
+        $totalChunks = [Math]::Ceiling($fileSize / $chunkSize)
+        $currentChunk = 0
+
+        for ($offset = 0; $offset -lt $fileSize; $offset += $chunkSize) {
+
+            $currentChunk++
+
+            $count = if (($offset + $chunkSize) -gt $fileSize) {
+                $fileSize - $offset
+            }
+            else {
+                $chunkSize
+            }
+
+            $buffer = [byte[]]::new($count)
+            [void]$stream.Read($buffer, 0, $count)
+
+            $lastByte = $offset + ($count - 1)
+
+            $range = 'bytes {0}-{1}/{2}' -f $offset, $lastByte, $fileSize
+
+            $contentHeaders = $baseHeaders.Clone()
+            $contentHeaders['Content-Range'] = $range
+            $contentHeaders['Content-Type'] = 'application/octet-stream'
+            $contentHeaders['x-ms-file-name'] = $file.Name
+
+            $UploadFileChunkRequest = @{
+                Uri     = $locationUri
+                Method  = 'Patch'
+                Headers = $contentHeaders
+                Body    = $buffer
+            }
+
+            Invoke-RestMethod @UploadFileChunkRequest | Out-Null
+
+            Write-Host "Uploaded chunk $currentChunk/$totalChunks"
         }
+    }
+    finally {
+        $stream.Dispose()
     }
 }
 
-function Import-CertificatesIntoStore {
-    param(
-        [StoreLocation]
-        $StoreLocation = [StoreLocation]::LocalMachine,
+function Get-FileColumnInChunks {
+    param (
+        [Parameter(Mandatory)]
+        [string]
+        $setName,
 
-        [StoreName]
-        $StoreName = [StoreName]::My,
+        [Parameter(Mandatory)]
+        [System.Guid]
+        $id,
 
-        [X509Certificate2]
-        [Parameter(Mandatory = $true)]
-        $Certificate
+        [Parameter(Mandatory)]
+        [string]
+        $columnName,
+
+        [Parameter(Mandatory)]
+        [ValidateScript({ Test-Path $_ -PathType Container })]
+        [string]
+        $outputDirectory
     )
 
-    $store = $null
+    $uri = '{0}{1}({2})/{3}/$value' -f $baseURI, $setName, $id, $columnName
+
+    $chunkSize = 4 * 1024 * 1024  # 4 MB
+
+    # Use minimal headers for file download (OData headers cause 400 on file endpoints)
+    $downloadHeaders = @{
+        'Authorization' = $baseHeaders['Authorization']
+        'Range'         = 'bytes=0-{0}' -f ($chunkSize - 1)
+    }
+
+    $InitialDownloadRequest = @{
+        Uri     = $uri
+        Method  = 'Get'
+        Headers = $downloadHeaders
+    }
+
+    $response = Invoke-WebRequest @InitialDownloadRequest
+
+    $fileName = $response.Headers['x-ms-file-name'][0]
+    $fileSize = [long]$response.Headers['x-ms-file-size'][0]
+
+    Write-Host "Downloading file: $fileName ($([Math]::Round($fileSize / 1MB, 2)) MB)"
+    Write-Host "Chunk size: $([Math]::Round($chunkSize / 1MB, 2)) MB"
+
+    $totalChunks = [Math]::Ceiling($fileSize / $chunkSize)
+    $currentChunk = 1
+
+    $outputFilePath = Join-Path $outputDirectory $fileName
+    $stream = [System.IO.File]::Create($outputFilePath)
     try {
-        $store = [X509Store]::new($StoreName, $StoreLocation)
-        $store.Open([OpenFlags]::ReadWrite)
-        $store.Add($Certificate)
-        $store.Close()
-        Write-Verbose "Certificate $($Certificate.SubjectName) installed"
-    } catch {
-        Write-CustomError "Failed to install certificate $($Certificate.SubjectName). Are you running this command as Administrator?"
-        throw
-    } finally {
-        if ($store) {
-            $store.Dispose()
+        $stream.Write([byte[]]$response.Content, 0, $response.Content.Length)
+
+        Write-Host "Downloaded chunk $currentChunk/$totalChunks"
+
+        $offset = $response.Content.Length
+
+        while ($offset -lt $fileSize) {
+
+            $currentChunk++
+
+            $lastByte = [Math]::Min($offset + $chunkSize - 1, $fileSize - 1)
+
+            $chunkHeaders = @{
+                'Authorization' = $baseHeaders['Authorization']
+                'Range'         = 'bytes={0}-{1}' -f $offset, $lastByte
+            }
+
+            $DownloadChunkRequest = @{
+                Uri     = $uri
+                Method  = 'Get'
+                Headers = $chunkHeaders
+            }
+
+            $response = Invoke-WebRequest @DownloadChunkRequest
+
+            $stream.Write([byte[]]$response.Content, 0, $response.Content.Length)
+            $offset += $response.Content.Length
+
+            Write-Host "Downloaded chunk $currentChunk/$totalChunks"
         }
     }
-}
-
-$MachineName = [System.Net.Dns]::GetHostEntry("").HostName
-$Subject = "Dynamics 365 Self-Hosted Sample Retail Server"
-$certSubjectName = "CN=$Subject"
-
-# Search for valid certificate in local store
-$cert = Get-CertificatesFromStore -SubjectName $certSubjectName
-if (($null -eq $cert)) {
-    if (-not $CheckOnly) {
-        Write-Host "Creating certificate for the '$MachineName' with subject '$Subject'"
-        $cert = New-SelfSignedCertificate -DnsName "$MachineName" `
-            -CertStoreLocation "cert:\LocalMachine\My" `
-            -Subject $certSubjectName `
-            -NotAfter (Get-Date).AddMonths(24)`
-            -KeySpec KeyExchange # This is to mitigate the CryptographicException: Invalid provider type specified.
-
-        Write-Host "Adding certificate for the '$MachineName' with subject '$Subject' to Trusted Root, the thumbprint is '$($cert.Thumbprint)'."
-        Import-CertificatesIntoStore -Certificate $cert -StoreName ([StoreName]::Root)
+    finally {
+        $stream.Dispose()
     }
-} else {
-    Write-Verbose "The certificate for the '$MachineName' with subject '$Subject' already exists, the thumbprint is '$($cert.Thumbprint)'."
-}
 
-#return the thumbprint of the found valid certificate
-if (($null -ne $cert)) {
-    $cert.Thumbprint
-}
-else
-{
-    $null
-}
+    Write-Host "File saved to: $outputFilePath"
 
+    return Get-Item $outputFilePath
+}
 # SIG # Begin signature block
 # MIInRgYJKoZIhvcNAQcCoIInNzCCJzMCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCQ9QtfXSQkzLFv
-# kJXOAJECN+WkdvAMjr4um+ZklrLFEKCCDLowggX1MIID3aADAgECAhMzAAACHU0Z
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAQDa6F4VMCcWb2
+# AhXP1c9qxGuHhH5vkZGE4gNDg73fLKCCDLowggX1MIID3aADAgECAhMzAAACHU0Z
 # yE7XD1dIAAAAAAIdMA0GCSqGSIb3DQEBCwUAMFcxCzAJBgNVBAYTAlVTMR4wHAYD
 # VQQKExVNaWNyb3NvZnQgQ29ycG9yYXRpb24xKDAmBgNVBAMTH01pY3Jvc29mdCBD
 # b2RlIFNpZ25pbmcgUENBIDIwMjQwHhcNMjYwNDE2MTg1OTQzWhcNMjcwNDE1MTg1
@@ -179,62 +247,62 @@ else
 # MR4wHAYDVQQKExVNaWNyb3NvZnQgQ29ycG9yYXRpb24xKDAmBgNVBAMTH01pY3Jv
 # c29mdCBDb2RlIFNpZ25pbmcgUENBIDIwMjQCEzMAAAIdTRnITtcPV0gAAAAAAh0w
 # DQYJYIZIAWUDBAIBBQCgga4wGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYK
-# KwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIOrrvVET
-# KnkmohM5oPXfHhftVWKcZBZQhz8A6fUDQi/3MEIGCisGAQQBgjcCAQwxNDAyoBSA
+# KwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIJGs/15G
+# S/0Ua8XWZwZCLfmX6UreSNDL1hJQYSdEbPvzMEIGCisGAQQBgjcCAQwxNDAyoBSA
 # EgBNAGkAYwByAG8AcwBvAGYAdKEagBhodHRwOi8vd3d3Lm1pY3Jvc29mdC5jb20w
-# DQYJKoZIhvcNAQEBBQAEggEAUj+amYYWnPmtdMqxJwOiNY39byOnhqsvQ4xBlBXh
-# WWYn/KWF8HXwxw8RRo4JUC7mXOumY8+y2eicifnGxWPQvFGXJS3ziiyJrTEzA1P/
-# 8IcMR0xQS80cwPxdBqluF7mqwZvCg03KITYWbP76qTT7VeDfl+vqRrqQ7LRcioNc
-# 2ruHUUVnCBeGYJxXLnczh205+D99ICHkpjMPuzM5IEdNNxrdvoDY9eJdWurYVxIc
-# BkRLe7fTLgrqzoX4FTJZADEXJ2aNshPvO8rxQuA/9w/X1ud8V1ISE27Mtwx45T6s
-# acI9VM2cJkCoxVPKh+i13R/z5vjZ54IE5MaHDdxxuYmX/qGCF5QwgheQBgorBgEE
+# DQYJKoZIhvcNAQEBBQAEggEAS+id+xt1CZSbkIubBQjs+A7kUHN9kXwcmmH8Qqi+
+# xxECARsf2QeCmeqXVDO6RnIGMsWwA7ha1OG8UnMZhDztgOWktSlMQdg6g55QY6wP
+# +ViKThg3dOlPF13fGy8uswa4//XY86ztSiPsgsZU47MjYP1/qr4ayGFTfhn4T4b5
+# riPiABwaPuRa2iZ7s7Rh4qAMaZcmp61u4rCqjZzxMg7yqOieFrFwupFp92u+lH/V
+# EBLkHWIyMa/xBsXzcBrCi2VITyC5ck16xC7p0wO9Q02PeNwejpE1wY62Mq9wAmUX
+# tREwMrnPMbnnGkBKjX6HwzYrGbiM1bPMw20P8Q/Davz69qGCF5QwgheQBgorBgEE
 # AYI3AwMBMYIXgDCCF3wGCSqGSIb3DQEHAqCCF20wghdpAgEDMQ8wDQYJYIZIAWUD
 # BAIBBQAwggFSBgsqhkiG9w0BCRABBKCCAUEEggE9MIIBOQIBAQYKKwYBBAGEWQoD
-# ATAxMA0GCWCGSAFlAwQCAQUABCD9L7MrWPhFgxl6rA6VG8IkVOhmeFoLtHFVqmhp
-# N7F3gAIGadfDuFYCGBMyMDI2MDQyODEwMTAwOC43MjZaMASAAgH0oIHRpIHOMIHL
+# ATAxMA0GCWCGSAFlAwQCAQUABCDZZRQYlMS00ew3yV580kVYyqDazljcQLyvn6D+
+# lDF8dwIGaeduni3eGBMyMDI2MDQyODEwMTAwOC42ODRaMASAAgH0oIHRpIHOMIHL
 # MQswCQYDVQQGEwJVUzETMBEGA1UECBMKV2FzaGluZ3RvbjEQMA4GA1UEBxMHUmVk
 # bW9uZDEeMBwGA1UEChMVTWljcm9zb2Z0IENvcnBvcmF0aW9uMSUwIwYDVQQLExxN
 # aWNyb3NvZnQgQW1lcmljYSBPcGVyYXRpb25zMScwJQYDVQQLEx5uU2hpZWxkIFRT
-# UyBFU046OTIwMC0wNUUwLUQ5NDcxJTAjBgNVBAMTHE1pY3Jvc29mdCBUaW1lLVN0
-# YW1wIFNlcnZpY2WgghHqMIIHIDCCBQigAwIBAgITMwAAAiNP2WAkU8/+KwABAAAC
-# IzANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzETMBEGA1UECBMKV2FzaGlu
+# UyBFU046QTkzNS0wM0UwLUQ5NDcxJTAjBgNVBAMTHE1pY3Jvc29mdCBUaW1lLVN0
+# YW1wIFNlcnZpY2WgghHqMIIHIDCCBQigAwIBAgITMwAAAifVwIPDsS5XLQABAAAC
+# JzANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzETMBEGA1UECBMKV2FzaGlu
 # Z3RvbjEQMA4GA1UEBxMHUmVkbW9uZDEeMBwGA1UEChMVTWljcm9zb2Z0IENvcnBv
 # cmF0aW9uMSYwJAYDVQQDEx1NaWNyb3NvZnQgVGltZS1TdGFtcCBQQ0EgMjAxMDAe
-# Fw0yNjAyMTkxOTM5NTdaFw0yNzA1MTcxOTM5NTdaMIHLMQswCQYDVQQGEwJVUzET
+# Fw0yNjAyMTkxOTQwMDRaFw0yNzA1MTcxOTQwMDRaMIHLMQswCQYDVQQGEwJVUzET
 # MBEGA1UECBMKV2FzaGluZ3RvbjEQMA4GA1UEBxMHUmVkbW9uZDEeMBwGA1UEChMV
 # TWljcm9zb2Z0IENvcnBvcmF0aW9uMSUwIwYDVQQLExxNaWNyb3NvZnQgQW1lcmlj
-# YSBPcGVyYXRpb25zMScwJQYDVQQLEx5uU2hpZWxkIFRTUyBFU046OTIwMC0wNUUw
+# YSBPcGVyYXRpb25zMScwJQYDVQQLEx5uU2hpZWxkIFRTUyBFU046QTkzNS0wM0Uw
 # LUQ5NDcxJTAjBgNVBAMTHE1pY3Jvc29mdCBUaW1lLVN0YW1wIFNlcnZpY2UwggIi
-# MA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQCK6Q2nk5WUdKzSCSafp+UjUARs
-# WxHKS63rJhFC/zSabFumTBuaJ0QNrmqevub5Db7fSj5qtwwKnjIO92+HXF67192f
-# ujL7DFot5WEj/AtEZ/XrzFHimKlN1h6gEQwP5I67wizaPW5ZzSBNpaLBg5oHvASP
-# OZtwdNUoZ+DQKF3hJl1KZuoIlVK+qi7cLjgak6s5oOZcRCMrKnuC3aoVa6wRDbYv
-# KUuj7rkFx9KO0PsHJ/k+LnZMggRheh4AVdawyh+oOzKPjlQGUNfSeWUgym2U9CLa
-# 8tt0mQX4DxDz6+ram50gj1oAfyQ6TQ7r96PADFOKBgaU7+cpHnaZG89dTegQ6ydB
-# RGIycOw1dRX2eKDRRzziK3cn0WaIm/7OeGsyQKjIzEQuUTDv0Jj/9zQ7truLOOpJ
-# D98BJVOK7je84Sz2hb3HvUST7j1j2N8peD6olkpFHR/1Z8Jz4F+mkrUF7MmPAirY
-# HRzunbIg3HrDMNwFYN7yBkDA4/VMo9CY0y9oGUoq2yjbCwTibz9VYl93nB3QQiTC
-# T9nW3M+TOWB+PMrZpExq1BSHmKPzIqehKqrUDoM33PK+dEKwpYLET6uXq4HuQRMX
-# WT//sPubUnQAaaUMfQhAZSy23HtxwtN3eK9+T4wCav2wQFt57eUOwUW5/DCzMF9t
-# ua5He1hNvgcAXaiG1wIDAQABo4IBSTCCAUUwHQYDVR0OBBYEFNbAh89v29nPY9bw
-# Qb1QYCzxVgeXMB8GA1UdIwQYMBaAFJ+nFV0AXmJdg/Tl0mWnG1M1GelyMF8GA1Ud
+# MA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQDixWy1fDOSL4qj3A1pady+elID
+# LwnF3UuLzJIOWwGHcEgrxxwtnyviUIDmmxylTUl1u+2rBPp2zT4BwwQhvGaJpExq
+# vPLlDFlbfmSflKI86eFqofiZ7j8NTRO4l7wGg9Njm+muNauTcFW2qdfIjKE950Ok
+# rm9MnMOGYy+fibNYdxTPRPq1T4MLZK3s3vdMyMEOldcOQkSKpxD6/1Gk6gOmCu2K
+# gI8f0ex6vYxnKDl9W0OLSEa/6y82oIbsm+1QBifOQ47xWKTG1CmvtGr85LzA75/M
+# AcUmRw5/of/qET0UFV1WulMcJrI6DASAsNCNB+6WLrotuBZAj+VMlqbn5RMZ6Q4I
+# Y7JwaAiIXh7VjxrnwUOYZG8WEGhfrA98di+7LEn9AqvvEOyG+UQcjVhCCbMGXigJ
+# XSApeyeWupCsD0jgQMNCxfB5BLBDWxgdY3dJBEPgxfkgTDQLBggtVv2d5CYxHKgI
+# ItB4bI5eSb5jkIG2WotnFetT0legpw/Eozwf39ao6tENY21eVWIzRw/GsmvwjYQF
+# 6vVrxOD0pGVsfqGF8s3VPeY7hI2TxHFMqNA0IB/a2NLY7JTxYAKAP/11EJZt7xbq
+# DLMgD1YDdGEzGpQijm3nAPCL2CebP/jmu90abJ2W425yglGHTI/nCBrwSpfRCgwz
+# rfFelJaCKM6+35aFfwIDAQABo4IBSTCCAUUwHQYDVR0OBBYEFNLW58N4MGSG6ud7
+# jWqgT92orfReMB8GA1UdIwQYMBaAFJ+nFV0AXmJdg/Tl0mWnG1M1GelyMF8GA1Ud
 # HwRYMFYwVKBSoFCGTmh0dHA6Ly93d3cubWljcm9zb2Z0LmNvbS9wa2lvcHMvY3Js
 # L01pY3Jvc29mdCUyMFRpbWUtU3RhbXAlMjBQQ0ElMjAyMDEwKDEpLmNybDBsBggr
 # BgEFBQcBAQRgMF4wXAYIKwYBBQUHMAKGUGh0dHA6Ly93d3cubWljcm9zb2Z0LmNv
 # bS9wa2lvcHMvY2VydHMvTWljcm9zb2Z0JTIwVGltZS1TdGFtcCUyMFBDQSUyMDIw
 # MTAoMSkuY3J0MAwGA1UdEwEB/wQCMAAwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwgw
-# DgYDVR0PAQH/BAQDAgeAMA0GCSqGSIb3DQEBCwUAA4ICAQCHQwe7z5tp4NZwAf1c
-# B+4c9J4svw3P6WqGBMxtqznS6DdzUzStXHCaPZhM41g1iKHNnmcnLjwLujOEaNjh
-# SnUDiAZqQjW5ZapOBxgc7Egghh9k+r78qWAe3rJ4QohBbhSGdZtKivTRaeRqmnhy
-# 8+ThrKhzCeEwaarXJimZwSpdQQUDbheWHeyAxASqultd5KO0m/UFvO03tfepqGXA
-# 4tCg/WGECwKqOjJzpRAfPIB6y1HyVrk+vmL5rpEbTwwLOtX7WxFGG8+cYLk9HjaD
-# kxraA/HYlKQRx1sdza+w/gulLwgOnByRJKF2rr8M7FNIlwoi6ywFpaNc8A7HewaG
-# jgw/tfcE260I1XekGluANI9HnONOYWlI7BKBQbWE2teo6vsQ1Vg8B8rTZSePVdmX
-# L1PPqqs3KVdFKM5kYocPCDM+6VL32IV96sESf2T7DjxanpCg2D2UYj4Z1i7cy8U1
-# LLDGg55KWs4af2RRBjH2MulHgAmW5obKxiZCDQjRaroJ2XElXUhigE9BzvhCFbT/
-# HDY2vpVpl5HnSpcCSxmL5i5lIT/xbAQMI7Luh75Xrm+IslfFWOGOGMlCp+24qEJE
-# glXEP7xwsolNdBNndXihhyIefVGlI1DR7xGELiJrk8ifVWYo9XEbEXv/lbvp6F2R
-# 2UsnweWckvq0y1HWnLHDqH6dPjCCB3EwggVZoAMCAQICEzMAAAAVxedrngKbSZkA
+# DgYDVR0PAQH/BAQDAgeAMA0GCSqGSIb3DQEBCwUAA4ICAQAqncud4PSC1teb2H6n
+# Ruy7sDiKK13FXJirVB4Tfwjdo2Mb+QL4j7wZ/k4G9P0CANHZFrDQcK0VFDTysrYu
+# 8Z0Aha14acDZPsyIoPvAGRRhaHEuf7NckRjkfa/ylo1KyII8jbL9N9sJAqBPL8V4
+# FNBjljv+1GHDOw127rZz5ZSTPoAPb2SA0v5yDgcpUMfxglPyp6cnPPoQpTtD9OGx
+# 8Dwm2P+o1TPxBIy6I0T9RauulogVCvKwflfeLTcKAvnSG1rCjerSXmU1DNXOsAD/
+# bsrSjgbX5mAbD7XTRMF/vawAWESFcn/BjjizxeWZb00aYSlkJA2rVtFlMM481aVW
+# XdAbXPP5RzUiWTlgyHf/G7lCxHYWGIZuB13T3aI6Y8mEgn/ou40aiFJo8r0+i0P5
+# GdNneWtxiR0CMKUfko+5s/73cwe1Wfp8BKXa270cicVQasFf5sRV7pFm+V7fNRXw
+# Cu7anTOmga76zO7/2t+zOlibvphT+Q6Zd+B2qYsSn4xBaY+YzHpnycLW5cvJyhPx
+# BCcb1oRYfhRzCADb2utI2EtGCjc2P2ii4LyR4QMb/n8cOweL9IqVTKKzzVk+zZJx
+# V3vrp4LyuQXw0O30la6BcHdNAAAB9UC83zs3G9d+AlIfZLM97tMUNKWjbBpIirFx
+# 6LTDFXVtZQd7hqzLYByjbjH0ujCCB3EwggVZoAMCAQICEzMAAAAVxedrngKbSZkA
 # AAAAABUwDQYJKoZIhvcNAQELBQAwgYgxCzAJBgNVBAYTAlVTMRMwEQYDVQQIEwpX
 # YXNoaW5ndG9uMRAwDgYDVQQHEwdSZWRtb25kMR4wHAYDVQQKExVNaWNyb3NvZnQg
 # Q29ycG9yYXRpb24xMjAwBgNVBAMTKU1pY3Jvc29mdCBSb290IENlcnRpZmljYXRl
@@ -277,41 +345,41 @@ else
 # VTNYs6FwZvKhggNNMIICNQIBATCB+aGB0aSBzjCByzELMAkGA1UEBhMCVVMxEzAR
 # BgNVBAgTCldhc2hpbmd0b24xEDAOBgNVBAcTB1JlZG1vbmQxHjAcBgNVBAoTFU1p
 # Y3Jvc29mdCBDb3Jwb3JhdGlvbjElMCMGA1UECxMcTWljcm9zb2Z0IEFtZXJpY2Eg
-# T3BlcmF0aW9uczEnMCUGA1UECxMeblNoaWVsZCBUU1MgRVNOOjkyMDAtMDVFMC1E
+# T3BlcmF0aW9uczEnMCUGA1UECxMeblNoaWVsZCBUU1MgRVNOOkE5MzUtMDNFMC1E
 # OTQ3MSUwIwYDVQQDExxNaWNyb3NvZnQgVGltZS1TdGFtcCBTZXJ2aWNloiMKAQEw
-# BwYFKw4DAhoDFQA4RWFs+kTiZnoZiAj1BtYj8zCNaqCBgzCBgKR+MHwxCzAJBgNV
+# BwYFKw4DAhoDFQAjHzqthPwO0GDckDMA6x54lIiMKqCBgzCBgKR+MHwxCzAJBgNV
 # BAYTAlVTMRMwEQYDVQQIEwpXYXNoaW5ndG9uMRAwDgYDVQQHEwdSZWRtb25kMR4w
 # HAYDVQQKExVNaWNyb3NvZnQgQ29ycG9yYXRpb24xJjAkBgNVBAMTHU1pY3Jvc29m
-# dCBUaW1lLVN0YW1wIFBDQSAyMDEwMA0GCSqGSIb3DQEBCwUAAgUA7ZqjMzAiGA8y
-# MDI2MDQyODAzMDgzNVoYDzIwMjYwNDI5MDMwODM1WjB0MDoGCisGAQQBhFkKBAEx
-# LDAqMAoCBQDtmqMzAgEAMAcCAQACAgZxMAcCAQACAhIzMAoCBQDtm/SzAgEAMDYG
+# dCBUaW1lLVN0YW1wIFBDQSAyMDEwMA0GCSqGSIb3DQEBCwUAAgUA7Zp90TAiGA8y
+# MDI2MDQyODAwMjkwNVoYDzIwMjYwNDI5MDAyOTA1WjB0MDoGCisGAQQBhFkKBAEx
+# LDAqMAoCBQDtmn3RAgEAMAcCAQACAgoQMAcCAQACAhK2MAoCBQDtm89RAgEAMDYG
 # CisGAQQBhFkKBAIxKDAmMAwGCisGAQQBhFkKAwKgCjAIAgEAAgMHoSChCjAIAgEA
-# AgMBhqAwDQYJKoZIhvcNAQELBQADggEBAIKGcs+WVffgieIgvX/7EXrGrktJAhqK
-# OoH4E0NFgmHs3g8fFb577R44F9ce68lh9HLB71UhqglfpOfjkDcsuX9dQaSCRLYE
-# skqgUqIAz2PnEwamSPJy8SKRbaQJMDLtUbePI06shRv59KrxCcBzG3hu3cgw8BX7
-# tpSpqQN6TxdRIbqQE5SJTZpKw9cOoPUHKmTQo0qIOx/F49mE+3N4pFeQaOAYYnRe
-# sHC43vhpc83oG3Ms9dv/QNELcTJ9Dted3Jh5jL7zyKHUKlbXvyOU6Kgtick68AWS
-# QnMht0aEk3Bf1u8aoee4DFWu2z/noK3cC9EfQKTkHZlICdQ8btsLhz4xggQNMIIE
+# AgMBhqAwDQYJKoZIhvcNAQELBQADggEBAHUzlQ+lTV1FjD54MD5IBjWKTmkMgVlm
+# kHCWGuQ6jyw5ixlnKSM8itQ1CCVYct6oDxFqY04zIEz03hH2CPtRvLrpOv9Jir2d
+# pB6fqFQp7pJXaopgU+8ZbVcTCFsNH9Aayu42C3papU4YDK+Ax4vOEKjIQodzA26m
+# O8G3ycJKkYq+t947aqLOQvdKtTqVlGtkrI70dXRcrnMdQRnL9o+xlvQjGN4TkfgY
+# H0ie2OsbUxAgfQg/yhjG2SnFltDt/nIsWZmEbHZRBUDOwKu9b7NzalqmmIDV5KFf
+# 06TxX65iu7687bV8PfMybSTJOuKDc3fPqtm6Xs6rodSKffwD+5XpMEgxggQNMIIE
 # CQIBATCBkzB8MQswCQYDVQQGEwJVUzETMBEGA1UECBMKV2FzaGluZ3RvbjEQMA4G
 # A1UEBxMHUmVkbW9uZDEeMBwGA1UEChMVTWljcm9zb2Z0IENvcnBvcmF0aW9uMSYw
-# JAYDVQQDEx1NaWNyb3NvZnQgVGltZS1TdGFtcCBQQ0EgMjAxMAITMwAAAiNP2WAk
-# U8/+KwABAAACIzANBglghkgBZQMEAgEFAKCCAUowGgYJKoZIhvcNAQkDMQ0GCyqG
-# SIb3DQEJEAEEMC8GCSqGSIb3DQEJBDEiBCDe2jo1A27azgXux8RZUm5MkjTeT1fj
-# Y0xDvjFdAZpglzCB+gYLKoZIhvcNAQkQAi8xgeowgecwgeQwgb0EIJbwMywRbvcG
-# iynjnwjAqcaD47yYvebKZRAvtEAR5u6zMIGYMIGApH4wfDELMAkGA1UEBhMCVVMx
+# JAYDVQQDEx1NaWNyb3NvZnQgVGltZS1TdGFtcCBQQ0EgMjAxMAITMwAAAifVwIPD
+# sS5XLQABAAACJzANBglghkgBZQMEAgEFAKCCAUowGgYJKoZIhvcNAQkDMQ0GCyqG
+# SIb3DQEJEAEEMC8GCSqGSIb3DQEJBDEiBCBZtGRKCAcYLsKfKNNj+uAP2v6bSALC
+# jwy3T/L6XEv7VjCB+gYLKoZIhvcNAQkQAi8xgeowgecwgeQwgb0EIOXnARo1oVIc
+# OLJKDqlE0adq/jZ9TXdlnXWRcXGThBFyMIGYMIGApH4wfDELMAkGA1UEBhMCVVMx
 # EzARBgNVBAgTCldhc2hpbmd0b24xEDAOBgNVBAcTB1JlZG1vbmQxHjAcBgNVBAoT
 # FU1pY3Jvc29mdCBDb3Jwb3JhdGlvbjEmMCQGA1UEAxMdTWljcm9zb2Z0IFRpbWUt
-# U3RhbXAgUENBIDIwMTACEzMAAAIjT9lgJFPP/isAAQAAAiMwIgQg1DjfpGSs2bTO
-# 4i+C4eK3GG895/9gNyOkoxse3FwSMhYwDQYJKoZIhvcNAQELBQAEggIAN0korgaV
-# qmvNh7bgJU2zESM5m84O+UUEE4WAMwVvU/hUyYMKQEZs6cYn/AHIfvjnIvaccgnM
-# zWwULLp2ANVBkvp3J5RgfAqvgEkB34Du6XQ375DvpL2VZUhDYYbZ2amBksDjg+1q
-# ytF7bdsJXf1m859bWi7Q0jxzGtpTua+2yf1stHZXOlKqL52tVBHMLBgW4W2IBvje
-# 88BF1pHBv27Z+e/Klo1Y/x/m7KgezMRSK6HqPgG5aggTfyI8R2T4cg6Q26KuBznM
-# +YrLKwRUlbYXcsRjf4UyWdACOjei9p/u4fbRBpz4PgcKe2qFCrzZANwDSGoZ6aTh
-# cbBJCz/bf8cN4dNAhwzoNZ+XlbKjsraWvCdYkV8eRIQvo3psM1kOMkPbElxpU/9r
-# Qk1WllB+RR48u+z/483EbfazJwXWR9Iwc8KTiDAtzC8PEeo2/tM6EMh2zA6BUa72
-# wPQkV7LmbvGdIdmFGSdhuAhdlQQIVBZmOHS00paJXQ6PoEcZ+nK7I2QP29J6R5/J
-# w1XXYkKQJs5yODf2MAbUl84Z/OJR1o1bsddjYWSuId1Gxr0bP/7CpJWwPEhuLPLw
-# oR8GrmN0Ha+79BraYP73XYmdjUYE5oAmujl404qBQ+r/MiejnwC3uZiADtzR9n97
-# H+PRnpTmk1jejaSphxCJckBZphjUobzvqas=
+# U3RhbXAgUENBIDIwMTACEzMAAAIn1cCDw7EuVy0AAQAAAicwIgQgIatkcB7/7kb7
+# AsUVd6OBSybuCzR91MKOdq9aLKlkNZIwDQYJKoZIhvcNAQELBQAEggIAYw83aO7H
+# GR652lO8dn/Xmos38G2jHDPrVTrq2S0DgQqMelVFyRAgYHZRUWozyhDZqaQtxMs1
+# p/ebtirKJaIjGPLLuaHECmsrfOE/uAMjgWcosauxmFoG8UdfFjTgB/waLd6Y4AEQ
+# I8ma9F5owMVD4UZwdAN6eCrqku9XQcy4rRU8kvHn585N8beM7sgiHzvpzUIeqJ1w
+# +ufsTcpVOTQwU/ZTpxZHsRADPhzr1tRJeKhRgtH7oPyybYBTCt56wNr3qN3KRdfr
+# pNxBHQTrwbiehsPgS9q4CN+GXagKBQc8HSWfUzDhXjxHOSiBji1X7PFfHK2DYTgy
+# 4/KpiUhhVwbWoTlh0tEP9kXFm48MiLD4/R3MkBHjqYlbEBRAdru27ISinboSzhqK
+# bLtPCrOXdJ3cKrYgvWnRZbUyrSPrydHZodPnVbK78+KBuW2JwGhdmw+irzlBmYzf
+# ZP3ge0MDw4tcOQDc426gV7ZeXBAEjR/mlhTzzVzxFP3wTBUq2Q1nTNC1e9OS3fVi
+# aBdRpeW+hFtw6X/C5/CmOBCJKbdjf11FG240oUHzGRuXOKJLBKINK8ayXG0SOXuR
+# MS90mVHaDhXavnS7d/lIYekceVoFfj5DqIFMy3YNAGPu4j4WAL4Hy+IwRDPYWR/E
+# +rtfpJa0jGAGJZ/Puxt8hRmz9eAci92Kzhc=
 # SIG # End signature block
