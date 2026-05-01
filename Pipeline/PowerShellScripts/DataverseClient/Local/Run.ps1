@@ -1,19 +1,139 @@
-param(
-    [string]$AzureKeyVaultURI,
-    [string]$ApplicationId,
-    [string]$ApplicationSecretValue,
-    [string]$CertificateName,
-    [string]$Timestamp,
-    [string]$Files,
-    [string]$TimestampDigest = "sha256"
+<#
+.SYNOPSIS
+    CLI entry point for local CSU extension package operations.
+
+.DESCRIPTION
+    Provides a unified command-line interface for uploading and downloading
+    CSU extension packages to/from Dataverse. Configure Local.vars.ps1 before use.
+
+.PARAMETER Command
+    The operation to perform: 'upload' or 'download'.
+
+.PARAMETER PackageName
+    (download only) The name of the CSU extension package to download.
+
+.PARAMETER PackageVersion
+    (download only) The version of the CSU extension package to download.
+
+.PARAMETER Help
+    Show detailed help and usage examples.
+
+.EXAMPLE
+    .\Run.ps1 upload
+
+.EXAMPLE
+    .\Run.ps1 download -PackageName "Contoso.Commerce" -PackageVersion "1.0.0"
+
+.EXAMPLE
+    .\Run.ps1 --help
+#>
+param (
+    [Parameter(Position = 0)]
+    [ValidateSet('upload', 'download')]
+    [String]
+    $Command,
+
+    [Parameter()]
+    [String]
+    $PackageName,
+
+    [Parameter()]
+    [String]
+    $PackageVersion,
+
+    [Parameter()]
+    [Alias('h', '?')]
+    [Switch]
+    $Help
 )
 
-AzureSignTool.exe sign -kvu "$AzureKeyVaultURI" -kvi "$ApplicationId" -kvs "$ApplicationSecretValue" -kvc "$CertificateName" -tr "$Timestamp" -td "$TimestampDigest" (-split $Files)
+$ErrorActionPreference = 'Stop'
+
+function Show-Help {
+    $help = @"
+
+CSU Extension Package CLI
+=========================
+
+Usage:  .\Run.ps1 <command> [options]
+
+Commands:
+
+  upload      Upload a CSU extension package to Dataverse.
+              The package path is set via ExtensionPackagePath in Local.vars.ps1.
+              If not set, defaults to the build output folder.
+              Package name and version are read from manifest.json inside the
+              package. The name + version pair must be unique per environment -
+              bump the version in manifest.json before re-uploading.
+
+  download    Download a CSU extension package from Dataverse.
+              Use -PackageName and -PackageVersion to specify which package.
+              The file is saved to OutputDirectory in Local.vars.ps1
+              (defaults to your Downloads folder).
+
+Options:
+  -Help, -h   Show this help message.
+
+Getting Started:
+  1. Open Local.vars.ps1 and fill in TenantId and DataverseEnvironmentUrl.
+  2. Set UseUserSignIn to `$true (recommended) or configure app credentials.
+  3. Run one of the commands below.
+
+Examples:
+  .\Run.ps1 upload
+  .\Run.ps1 download -PackageName "Contoso.Commerce" -PackageVersion "1.0.0.0"
+
+"@
+    Write-Host $help
+}
+
+# Show help if requested or no command given.
+if ($Help -or [string]::IsNullOrWhiteSpace($Command)) {
+    Show-Help
+    return
+}
+
+# Validate configuration.
+. $PSScriptRoot\Local.vars.ps1
+
+$missing = @()
+if ([string]::IsNullOrWhiteSpace($TenantId))                { $missing += 'TenantId' }
+if ([string]::IsNullOrWhiteSpace($DataverseEnvironmentUrl))  { $missing += 'DataverseEnvironmentUrl' }
+if ($missing) {
+    Write-Host "`nPlease set the following in Local.vars.ps1 before running:" -ForegroundColor Red
+    $missing | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
+    Write-Host "`nFile: $PSScriptRoot\Local.vars.ps1`n"
+    return
+}
+
+# Prompt for command-specific parameters if not provided.
+if ($Command -eq 'download') {
+    if ([string]::IsNullOrWhiteSpace($PackageName)) {
+        $PackageName = Read-Host 'Enter the package name to download'
+        if ([string]::IsNullOrWhiteSpace($PackageName)) { throw 'PackageName is required for download.' }
+    }
+    if ([string]::IsNullOrWhiteSpace($PackageVersion)) {
+        $PackageVersion = Read-Host 'Enter the package version to download'
+        if ([string]::IsNullOrWhiteSpace($PackageVersion)) { throw 'PackageVersion is required for download.' }
+    }
+}
+
+switch ($Command) {
+    'upload' {
+        & $PSScriptRoot\Local.UploadExtensionPackage.ps1
+    }
+    'download' {
+        & $PSScriptRoot\Local.DownloadExtensionPackage.ps1 `
+            -PackageName $PackageName `
+            -PackageVersion $PackageVersion
+    }
+}
+
 # SIG # Begin signature block
 # MIIncQYJKoZIhvcNAQcCoIInYjCCJ14CAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAeqoz9GtLmL3Ji
-# S0sx+OrBac0lFyIiIjk31FhXBJLvw6CCDMkwggYEMIID7KADAgECAhMzAAACHPrN
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDqbqvq5rsaFn2l
+# +zHEbWyYYvkL5VyLqe+LdJ1Yl40euqCCDMkwggYEMIID7KADAgECAhMzAAACHPrN
 # xZvoL37EAAAAAAIcMA0GCSqGSIb3DQEBCwUAMFcxCzAJBgNVBAYTAlVTMR4wHAYD
 # VQQKExVNaWNyb3NvZnQgQ29ycG9yYXRpb24xKDAmBgNVBAMTH01pY3Jvc29mdCBD
 # b2RlIFNpZ25pbmcgUENBIDIwMjQwHhcNMjYwNDE2MTg1OTQxWhcNMjcwNDE1MTg1
@@ -86,18 +206,18 @@ AzureSignTool.exe sign -kvu "$AzureKeyVaultURI" -kvi "$ApplicationId" -kvs "$App
 # KDAmBgNVBAMTH01pY3Jvc29mdCBDb2RlIFNpZ25pbmcgUENBIDIwMjQCEzMAAAIc
 # +s3Fm+gvfsQAAAAAAhwwDQYJYIZIAWUDBAIBBQCgga4wGQYJKoZIhvcNAQkDMQwG
 # CisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZI
-# hvcNAQkEMSIEIGre7wqeoo7R8YZTaLrHeNdmnwZ67zzKYPt6W44PmYnsMEIGCisG
+# hvcNAQkEMSIEIHOzdhZNektNXIsyABzoQEpYGRzfc8xQ5BDUesN6bmGXMEIGCisG
 # AQQBgjcCAQwxNDAyoBSAEgBNAGkAYwByAG8AcwBvAGYAdKEagBhodHRwOi8vd3d3
-# Lm1pY3Jvc29mdC5jb20wDQYJKoZIhvcNAQEBBQAEggEATfXvKHYLXj0yst2HkPXu
-# YJIpvhUOQzeQDUcGBKhKAMM8gsna0qUieoBraIHLGkWlVZbAztmQfXFwUg+4OLGk
-# 55+sKwLklwO3xsoEj4TGXHEP4ab1sn5SIuP1doimSrRLG8Aw+LlmT5Kr+YOXO61m
-# EP+R7uVjoonllKWsNmel5z8zTPOF4XiTgYL7BRMzRIj4IzWwhKly4jC8peg1Sgjz
-# zl+n3ZYNFKl3mVvt1+hpTe90qCiLBEgcRZekDmQ9HPZVWvRdVH3ADeNcuYl20iT6
-# rS6kccMg5IhT7Ih+Jp+fZrMGBfeO8Y/zcnoHS5VE+h3ftdsUvX25Gctql3Rs79sT
-# iqGCF7AwghesBgorBgEEAYI3AwMBMYIXnDCCF5gGCSqGSIb3DQEHAqCCF4kwgheF
+# Lm1pY3Jvc29mdC5jb20wDQYJKoZIhvcNAQEBBQAEggEADAFW+p6z2uXgaDUmUqH1
+# nMUwBSPFCOK92R1r8Pbs48zKJpwXitV1VWXDtHj99iWoxtqN1pIo5izHkdALhGz1
+# Zq68TQpI1aE6Kphu9SfwCGT4we53MliCgsPdMABhZt6D0JVf0rZJPmmipxgntLEx
+# leWJGs3G3fmrohelnnsR1VA6PSiH8bw6rE6zdk7Mi1dtUs2POXXvm/tCByycTESW
+# OI8zHxRiPNf/XkKMmsrvWxVKoasPMTqFjjnRMajyShVsMFErH3KA1Tusl9C+5LhL
+# nY91G4jXKjZWzlDpKHDYxJAedr3eu/qhodFZY0yPR4euk3qrgY9C5BvGvfCUaTt1
+# oaGCF7AwghesBgorBgEEAYI3AwMBMYIXnDCCF5gGCSqGSIb3DQEHAqCCF4kwgheF
 # AgEDMQ8wDQYJYIZIAWUDBAIBBQAwggFaBgsqhkiG9w0BCRABBKCCAUkEggFFMIIB
-# QQIBAQYKKwYBBAGEWQoDATAxMA0GCWCGSAFlAwQCAQUABCDWpzKBAQDIPeGaZ9BT
-# modmAbmaiTkONTQoG6cSj1euywIGaewN2/gwGBMyMDI2MDUwMTA2MzEwMS45MTNa
+# QQIBAQYKKwYBBAGEWQoDATAxMA0GCWCGSAFlAwQCAQUABCCsBz4XboyBmzA1kvnX
+# y2PbarISUmzYxLhD4LFgUsudEQIGaewN2/gnGBMyMDI2MDUwMTA2MzEwMS4zNjFa
 # MASAAgH0oIHZpIHWMIHTMQswCQYDVQQGEwJVUzETMBEGA1UECBMKV2FzaGluZ3Rv
 # bjEQMA4GA1UEBxMHUmVkbW9uZDEeMBwGA1UEChMVTWljcm9zb2Z0IENvcnBvcmF0
 # aW9uMS0wKwYDVQQLEyRNaWNyb3NvZnQgSXJlbGFuZCBPcGVyYXRpb25zIExpbWl0
@@ -203,22 +323,22 @@ AzureSignTool.exe sign -kvu "$AzureKeyVaultURI" -kvi "$ApplicationId" -kvs "$App
 # B1JlZG1vbmQxHjAcBgNVBAoTFU1pY3Jvc29mdCBDb3Jwb3JhdGlvbjEmMCQGA1UE
 # AxMdTWljcm9zb2Z0IFRpbWUtU3RhbXAgUENBIDIwMTACEzMAAAIXcfsupa8BHeoA
 # AQAAAhcwDQYJYIZIAWUDBAIBBQCgggFKMBoGCSqGSIb3DQEJAzENBgsqhkiG9w0B
-# CRABBDAvBgkqhkiG9w0BCQQxIgQgLTVfj74Vn5GoXRmcchsUqHXX4qi0sZDvYF/Z
-# IaqS810wgfoGCyqGSIb3DQEJEAIvMYHqMIHnMIHkMIG9BCDQ8lBgPl23yZ0SzUSt
+# CRABBDAvBgkqhkiG9w0BCQQxIgQgfQUDwO+wYS4p5LgA3dMgMpM1TowubQJhZWCx
+# Lhvch5gwgfoGCyqGSIb3DQEJEAIvMYHqMIHnMIHkMIG9BCDQ8lBgPl23yZ0SzUSt
 # 5phOIegHPywrkNwevxe2k+RaWzCBmDCBgKR+MHwxCzAJBgNVBAYTAlVTMRMwEQYD
 # VQQIEwpXYXNoaW5ndG9uMRAwDgYDVQQHEwdSZWRtb25kMR4wHAYDVQQKExVNaWNy
 # b3NvZnQgQ29ycG9yYXRpb24xJjAkBgNVBAMTHU1pY3Jvc29mdCBUaW1lLVN0YW1w
 # IFBDQSAyMDEwAhMzAAACF3H7LqWvAR3qAAEAAAIXMCIEIKm86j1MnvvCKAhkw05i
-# fAsxK2+qtXkrccbLnzKKZIW+MA0GCSqGSIb3DQEBCwUABIICACKygQ7sgNJFFSaE
-# rEXcy8La5lpQ5OJm8sUmKnEFhNzEwx7y9Xi37/ShQRPzUwVzviiozd1FtZ8CPl/n
-# ZnoWBOVHBlMIPBwAn2S0z0wmU1vgeStjt9Ykwlk0A6VK248FCLUUwifwe+CSGlWj
-# ygT7JbILjAQznGG1Kct/ayd2R7GrbaXfmKmWqbnhc6rvaS7wZz7ebBJPbinBdodS
-# +0ksne8tkZgQvLC9+BYsy3e+aaVRZ1ycyVT1SpZprk2b/I5B2pF74kd/2VDJ2mE+
-# fL3cTx8RM0+eCvFT50UELP09Ba7jlYrDHyS4D9BrSPxLOPq7nzrOYPDWCQHCJy4e
-# ciyrcqxpvpXaNeYNmk96NfDNPTr1SZdCaTmOqNFXlqw9+pI9S2ZdiDj2upI3uFMd
-# N8POk0vXaA0zU/n94YVgiAziWVyb5HHsXhuVFz/7RWxJ5k9KWOmVxvQeWHN7VelO
-# O0epsak7ubXa4XAH3i1olp/rwEhVr/VTm3+lj81yy/p1x/a4IwqIMZdedu8xmOfr
-# I96/8lIQhrEC9R0POFwO9kQ6uWYSat5d/2XAUEyFUYSdQOjEQImKmj0BJK8OL5x6
-# 8jPgKZsJXFhOwf645Q2tV6gWNnG8lq39nPFAi5Nhx9YcpmcjqQZVGEKjEspXGAmc
-# lPoxTMaJFCglOGtl524CjMOpkS0v
+# fAsxK2+qtXkrccbLnzKKZIW+MA0GCSqGSIb3DQEBCwUABIICACoYZ7UcH4Fm1wm4
+# ngrLvwHRKipzRxfh2QcwVfYuGMnxcS044BPHjrb3fB24J3Q106q7yMzSpCjTyE31
+# 06V2ztuY5aCo8VXVURrPFjoQxM4Vedopa6gslaf0k7IFns+5NmJ9t6MtMVDwv8To
+# kzYhXGKX3znwYugp1yfhX+VrlslFRrKvB0IKfr/serpmTUlMjR9Brj5I4ko17kZC
+# IZt13CE2pDjeKvM9S4XeC7gJg4F1qo9NlrrpanCOsXGdXYmfh3GqkzgwOgvKMYEA
+# Jer6YnkwE8ejiQyz9XGPMmPOP7+7aN99NCjhkY3sWSOGv6kh9QQWEgNc5hUUDfkT
+# Tujkv0xiNxer3AvF1f6lQFws8KLXv/dLD2u/m1+8tXhX9+app8lOVfltJQOZ4tQz
+# GaXHqGtpsIZA1aS9qYkchr0zMcZOtC1Y+q5Ot+oAW0KN53uDzGLlp/HaKPcm8Gtp
+# I2t+roza6WLKrjrQlJJ4etg2Nc4Lw9G1CArXTQl2KC0tksNTrd6c1ZtdlFb++yJs
+# CmHVoww088IUfiLP03pGyvT3UTHFLlig3XUhobvsWIrfYLlKpWNjOOORMZqvIR5K
+# 8B3Q78F998r1uDkgic6fklfIGfuitns1noXN1ENJ5p5a8JDPD3SzpEhyzQhIKHAI
+# PEydiPBHYuv7IIvfWAFPYcNIMrqE
 # SIG # End signature block
