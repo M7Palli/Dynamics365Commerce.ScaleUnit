@@ -1,4 +1,4 @@
-﻿{
+{
   "$schema": "./devDependencies/schemas/manifestSchema.json",
   "name": "Contoso.Pos.FullSystemExample.Sample",
   "publisher": "Contoso",

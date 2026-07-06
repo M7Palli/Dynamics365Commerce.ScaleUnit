@@ -82,6 +82,29 @@
 
     // Clean and uninstall tasks
     {
+      "label": "install-store-commerce", // Build and install the Store Commerce extension
+      "type": "shell",
+      "windows": {
+        "command": [
+          "\"${workspaceRoot}\\Scripts\\Install-StoreCommerce.ps1\""
+        ]
+      },
+      "dependsOrder": "sequence",
+      "dependsOn" : [
+        "build-extension"
+      ]
+    },
+    {
+      "label": "uninstall-store-commerce", // Uninstall the Store Commerce extension
+      "type": "shell",
+      "windows": {
+        "command": [
+          "\"${workspaceRoot}\\Scripts\\Uninstall-StoreCommerce.ps1\""
+        ]
+      }
+    },
+    // Clean and uninstall tasks
+    {
       "label": "uninstall", // Uninstall everything
       "type": "shell",
       "dependsOrder": "sequence",
