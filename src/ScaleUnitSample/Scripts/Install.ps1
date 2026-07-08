@@ -278,7 +278,7 @@ else {
 
 Write-Host
 Write-Host "Installing the extension."
-& "$workspaceFolder\Installer\bin\Debug\net472\ScaleUnit.Sample.Installer.exe" install
+& "$workspaceFolder\Installer\bin\Debug\net48\ScaleUnit.Sample.Installer.exe" install
 
 if ($LastExitCode -ne 0) {
     Write-Host

@@ -16,7 +16,7 @@
       "baseProduct_Config" : "",
       // Base product deployment type
       // set it to "false" to install the RetailServer on IIS
-      "baseProduct_UseSelfHost" : "true"
+      "baseProduct_UseSelfHost" : "false"
     }
   },
   "tasks": [

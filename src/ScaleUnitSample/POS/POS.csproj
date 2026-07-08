@@ -12,23 +12,6 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Explicitly include compiled JS files for packaging (the SDK excludes .js from default content glob) -->
-    <Content Include="**\*.js" Exclude="devDependencies\**;obj\**" />
-  </ItemGroup>
-
-  <ItemGroup>
     <ProjectReference Include="..\CommerceRuntime\CommerceRuntime.csproj" ReferenceOutputAssembly="false" SkipGetTargetFrameworkProperties="true" />
   </ItemGroup>
-
-  <!-- Copy compiled TypeScript outputs from obj to source directories before packaging -->
-  <Target Name="CopyCompiledTypeScriptToSource" BeforeTargets="GetCommercePackagingOutput" Condition="'$(MSBuildProjectName)' == 'POS'">
-    <ItemGroup>
-      <CompiledJs Include="obj\Debug\netstandard2.0\**\*.js" />
-    </ItemGroup>
-    <!-- Copy while preserving relative directory structure -->
-    <Copy SourceFiles="@(CompiledJs)" 
-          DestinationFiles="@(CompiledJs->'%(RecursiveDir)%(Filename)%(Extension)')" 
-          SkipUnchangedFiles="true" />
-    <Message Text="Copied TypeScript outputs to source tree for packaging" Importance="high" />
-  </Target>
 </Project>
