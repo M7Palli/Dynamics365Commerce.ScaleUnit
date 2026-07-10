@@ -128,4 +128,4 @@ devDependencies/
 .pid
 .sign/
 
-src/ScaleUnitSample/Download/*.exe
+#src/ScaleUnitSample/Download/*.exe
