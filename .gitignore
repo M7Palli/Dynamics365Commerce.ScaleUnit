@@ -127,3 +127,5 @@ devDependencies/
 # Ignore generated build artifacts
 .pid
 .sign/
+
+src/ScaleUnitSample/Download/*.exe
